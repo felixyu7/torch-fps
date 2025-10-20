@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -21,7 +21,7 @@ def farthest_point_sampling(
     start_idx: Optional[Tensor] = None,
     random_start: bool = True,
     generator: Optional[torch.Generator] = None,
-) -> Tuple[Tensor, Tensor]:
+) -> Tensor:
     """
     Farthest point sampling with native CPU/CUDA acceleration.
 
@@ -31,20 +31,19 @@ def farthest_point_sampling(
         valid_mask:
             Bool tensor with shape `[B, N]`; False marks padded / invalid points.
         K:
-            Integer number of samples to draw per batch element (`0 <= K <= N`).
+            Integer number of samples to draw per batch element.
+            Must satisfy `K <= number of valid points` for all batches.
         start_idx:
             Optional `[B]` long tensor providing the first index per batch.
         random_start:
             If `True` (default) and `start_idx` is not supplied, draw a random
-            first index whenever a batch has more than `K` valid points.
+            first index from valid points.
         generator:
             Optional `torch.Generator` used for deterministic random starts.
 
     Returns:
         idx:
             Long tensor `[B, K]` with the selected point indices.
-        validK:
-            Bool tensor `[B, K]` indicating which positions are real selections.
     """
     if points.dim() != 3:
         raise ValueError("points tensor must have shape [B, N, D]")
@@ -58,10 +57,7 @@ def farthest_point_sampling(
     if K == 0:
         B = points.shape[0]
         device = points.device
-        return (
-            torch.zeros((B, 0), device=device, dtype=torch.long),
-            torch.zeros((B, 0), device=device, dtype=torch.bool),
-        )
+        return torch.zeros((B, 0), device=device, dtype=torch.long)
 
     device = points.device
     dtype = points.dtype
@@ -75,9 +71,15 @@ def farthest_point_sampling(
     mask_c = valid_mask.contiguous()
 
     counts = mask_c.sum(dim=1, dtype=torch.long)
-    K_tensor = torch.as_tensor(K, device=device, dtype=counts.dtype)
-    K_eff = torch.minimum(counts, K_tensor)
-    validK = torch.arange(K, device=device)[None, :] < K_eff[:, None]
+
+    # FPS is a downsampling algorithm - require K <= counts
+    if K > 0:
+        insufficient = counts < K
+        if bool(insufficient.any()):
+            raise ValueError(
+                f"FPS requires K <= number of valid points. "
+                f"Found batch(es) with K={K} but fewer valid points."
+            )
 
     if start_idx is not None:
         start_idx = start_idx.to(device=device, dtype=torch.long)
@@ -85,16 +87,22 @@ def farthest_point_sampling(
             raise ValueError("start_idx must have shape [B]")
     else:
         if random_start:
-            rand = torch.rand(
-                B, device=device, dtype=dtype, generator=generator
-            )
-            counts_float = counts.to(dtype=dtype)
-            first = torch.floor(rand * counts_float.clamp(min=1)).to(torch.long)
-            first = first.masked_fill(counts == 0, 0)
-            large_batches = counts > K_tensor
-            start_idx = torch.where(
-                large_batches, first, torch.zeros_like(first)
-            )
+            # Properly sample a random valid point using multinomial
+            # multinomial expects probabilities, so we convert mask to float
+            has_points = counts > 0
+            if bool(has_points.any()):
+                mask_float = mask_c[has_points].float()
+                # Sample 1 index per batch from the valid points
+                sampled = torch.multinomial(
+                    mask_float,
+                    num_samples=1,
+                    replacement=False,
+                    generator=generator
+                ).squeeze(1)
+                start_idx = torch.zeros(B, device=device, dtype=torch.long)
+                start_idx[has_points] = sampled
+            else:
+                start_idx = torch.zeros(B, device=device, dtype=torch.long)
         else:
             start_idx = torch.zeros(B, device=device, dtype=torch.long)
 
@@ -129,10 +137,10 @@ def farthest_point_sampling(
         idx = _C.fps_forward(points_c, mask_c, start_idx, K)
     except RuntimeError as exc:
         message = str(exc)
-        if _C is None or (points_c.is_cuda() and "built without CUDA" in message):
-            # validK from the accelerated path remains correct
-            idx, _ = batched_fps_baseline(points_c, mask_c, K, start_idx)
-            return idx, validK
+        if _C is None or (points_c.is_cuda and "built without CUDA" in message):
+            # Fall back to baseline implementation
+            idx = batched_fps_baseline(points_c, mask_c, K, start_idx)
+            return idx
         raise
 
-    return idx, validK
+    return idx

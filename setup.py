@@ -56,7 +56,8 @@ def get_extensions():
     use_cuda = torch.utils.cpp_extension.CUDA_HOME is not None
     if use_cuda:
         cuda_sources = sources + ["torch_fps/fps_cuda.cu"]
-        extra_compile_args["nvcc"] = ["-O3"]
+        extra_compile_args["cxx"].append("-DWITH_CUDA")
+        extra_compile_args["nvcc"] = ["-O3", "-DWITH_CUDA"]
         if sys.platform == "darwin":
             extra_compile_args["nvcc"].extend(["-Xcompiler", "-stdlib=libc++"])
         extensions.append(

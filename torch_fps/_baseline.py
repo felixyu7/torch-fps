@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 from torch import Tensor
 
@@ -11,24 +9,33 @@ def batched_fps_baseline(
     valid_mask: Tensor,
     K: int,
     start_idx: Tensor,
-) -> Tuple[Tensor, Tensor]:
+) -> Tensor:
     """
     Baseline batched farthest point sampling using vectorized PyTorch ops.
     Mirrors the original Python implementation but with an explicit starting
     index tensor per batch to keep seed control in the caller.
+
+    Returns:
+        idx: Long tensor `[B, K]` with the selected point indices.
     """
     if points.numel() == 0:
         B = points.shape[0] if points.dim() > 0 else 0
-        empty = torch.zeros((B, 0), device=points.device, dtype=torch.long)
-        empty_bool = torch.zeros((B, 0), device=points.device, dtype=torch.bool)
-        return empty, empty_bool
+        return torch.zeros((B, 0), device=points.device, dtype=torch.long)
 
     B, N, _ = points.shape
     device = points.device
     dtype = points.dtype
 
     counts = valid_mask.sum(dim=1)
-    K_eff = torch.minimum(counts, torch.as_tensor(K, device=device, dtype=counts.dtype))
+
+    # Caller should ensure K <= counts for all batches
+    if K > 0:
+        insufficient = counts < K
+        if bool(insufficient.any()):
+            raise ValueError(
+                f"Baseline FPS requires K <= number of valid points. "
+                f"Found batch(es) with K={K} but fewer valid points."
+            )
 
     start_idx = start_idx.clone()
     start_idx = start_idx.masked_fill(counts == 0, 0)
@@ -49,7 +56,6 @@ def batched_fps_baseline(
             )
 
     idx = torch.zeros((B, K), device=device, dtype=torch.long)
-    validK = torch.arange(K, device=device)[None, :] < K_eff[:, None]
 
     inf = torch.tensor(float("inf"), device=device, dtype=dtype)
     min_dists = torch.full((B, N), inf, device=device, dtype=dtype)
@@ -70,4 +76,4 @@ def batched_fps_baseline(
         min_dists = torch.minimum(min_dists, d)
         last = torch.argmax(min_dists, dim=1)
 
-    return idx, validK
+    return idx
