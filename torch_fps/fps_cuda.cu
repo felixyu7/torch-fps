@@ -88,29 +88,20 @@ __global__ void fps_kernel_cuda(
     }
 
     for (int64_t i = 0; i < K; ++i) {
-        if (threadIdx.x == 0) {
-            batch_idx[i] = last;
-            if (batch_mask[last]) {
-                batch_min_dists[last] = neg_inf;
-            }
-        }
-        __syncthreads();
+        // All threads read the current selection from shared memory
+        last = shared_last;
 
-        if (i + 1 >= effective_k) {
-            continue;
-        }
-
+        // Phase 1: Update min_dists based on distance to current centroid
+        // This matches: d = (points - c[:, None, :]).square().sum(dim=2)
+        //               min_dists = torch.minimum(min_dists, d)
         acc_t centroid_vals[MAX_D];
         for (int64_t d = 0; d < D; ++d) {
             centroid_vals[d] = static_cast<acc_t>(batch_points[last * D + d]);
         }
 
-        acc_t best_val = -std::numeric_limits<acc_t>::infinity();
-        int64_t best_idx = last;
-
         for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
             if (!batch_mask[n]) {
-                continue;
+                continue;  // Skip distance computation for invalid points
             }
 
             const scalar_t* point = batch_points + n * D;
@@ -121,44 +112,62 @@ __global__ void fps_kernel_cuda(
                 dist += diff * diff;
             }
 
-            acc_t current = batch_min_dists[n];
-            if (dist < current) {
-                current = dist;
-            }
-            batch_min_dists[n] = current;
-
-            if (current > best_val ||
-                (current == best_val && n < best_idx)) {
-                best_val = current;
-                best_idx = n;
+            // Update minimum distance
+            if (dist < batch_min_dists[n]) {
+                batch_min_dists[n] = dist;
             }
         }
-
-        shared_vals[threadIdx.x] = best_val;
-        shared_idx[threadIdx.x] = best_idx;
         __syncthreads();
 
-        for (int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1) {
-            if (threadIdx.x < offset) {
-                const acc_t other_val = shared_vals[threadIdx.x + offset];
-                const int64_t other_idx = shared_idx[threadIdx.x + offset];
-                const acc_t current_val = shared_vals[threadIdx.x];
-                const int64_t current_idx = shared_idx[threadIdx.x];
+        // Record selection (matches: idx[:, i] = last)
+        if (threadIdx.x == 0) {
+            batch_idx[i] = last;
+        }
+        __syncthreads();
 
-                if (other_val > current_val ||
-                    (other_val == current_val && other_idx < current_idx)) {
-                    shared_vals[threadIdx.x] = other_val;
-                    shared_idx[threadIdx.x] = other_idx;
+        // Find next farthest point (matches: last = torch.argmax(min_dists, dim=1))
+        if (i + 1 < K) {
+            // Phase 2: Each thread finds local argmax over its subset
+            acc_t best_val = neg_inf;
+            int64_t best_idx = 0;
+
+            for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
+                // argmax over all points (invalids have 0.0, selected have 0.0 after update)
+                const acc_t val = batch_min_dists[n];
+                if (val > best_val || (val == best_val && n < best_idx)) {
+                    best_val = val;
+                    best_idx = n;
                 }
+            }
+
+            shared_vals[threadIdx.x] = best_val;
+            shared_idx[threadIdx.x] = best_idx;
+            __syncthreads();
+
+            // Deterministic parallel reduction: always prefer lower index on ties
+            for (int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1) {
+                if (threadIdx.x < offset) {
+                    const acc_t other_val = shared_vals[threadIdx.x + offset];
+                    const int64_t other_idx = shared_idx[threadIdx.x + offset];
+                    const acc_t current_val = shared_vals[threadIdx.x];
+                    const int64_t current_idx = shared_idx[threadIdx.x];
+
+                    // Deterministic tie-breaking: prefer lower index
+                    if (other_val > current_val ||
+                        (other_val == current_val && other_idx < current_idx)) {
+                        shared_vals[threadIdx.x] = other_val;
+                        shared_idx[threadIdx.x] = other_idx;
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (threadIdx.x == 0) {
+                last = shared_idx[0];
+                shared_last = last;
             }
             __syncthreads();
         }
-
-        if (threadIdx.x == 0) {
-            last = shared_idx[0];
-            shared_last = last;
-        }
-        __syncthreads();
     }
 }
 

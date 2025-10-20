@@ -87,22 +87,14 @@ def farthest_point_sampling(
             raise ValueError("start_idx must have shape [B]")
     else:
         if random_start:
-            # Properly sample a random valid point using multinomial
-            # multinomial expects probabilities, so we convert mask to float
-            has_points = counts > 0
-            if bool(has_points.any()):
-                mask_float = mask_c[has_points].float()
-                # Sample 1 index per batch from the valid points
-                sampled = torch.multinomial(
-                    mask_float,
-                    num_samples=1,
-                    replacement=False,
-                    generator=generator
-                ).squeeze(1)
-                start_idx = torch.zeros(B, device=device, dtype=torch.long)
-                start_idx[has_points] = sampled
+            # Random initial point per batch (matches vectorized floor(rand * counts) approach)
+            # Note: assumes valid points are densely packed at indices [0, ..., counts-1]
+            if generator is not None:
+                rand = torch.rand(B, device=device, dtype=dtype, generator=generator)
             else:
-                start_idx = torch.zeros(B, device=device, dtype=torch.long)
+                rand = torch.rand(B, device=device, dtype=dtype)
+            start_idx = torch.floor(rand * counts.to(dtype).clamp(min=1)).to(torch.long)
+            start_idx = start_idx.masked_fill(counts == 0, 0)
         else:
             start_idx = torch.zeros(B, device=device, dtype=torch.long)
 

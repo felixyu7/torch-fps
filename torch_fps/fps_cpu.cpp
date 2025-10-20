@@ -49,27 +49,17 @@ void fps_kernel_cpu(
     }
 
     for (int64_t i = 0; i < K; ++i) {
-        out_indices[i] = last;
-        if (mask[last]) {
-            min_dists[last] = neg_inf;
-        }
-
-        if (i + 1 >= effective_k) {
-            continue;
-        }
-
+        // Update min_dists based on distance to current centroid
+        // This matches: d = (points - c[:, None, :]).square().sum(dim=2)
+        //               min_dists = torch.minimum(min_dists, d)
         const scalar_t* centroid = points + last * D;
-
-        acc_t best_val = -std::numeric_limits<acc_t>::infinity();
-        int64_t best_idx = last;
 
         for (int64_t n = 0; n < N; ++n) {
             if (!mask[n]) {
-                continue;
+                continue;  // Skip distance computation for invalid points
             }
 
             const scalar_t* point = points + n * D;
-
             acc_t dist = acc_t(0);
             for (int64_t d = 0; d < D; ++d) {
                 const acc_t diff =
@@ -77,20 +67,31 @@ void fps_kernel_cpu(
                 dist += diff * diff;
             }
 
-            acc_t current = min_dists[n];
-            if (dist < current) {
-                current = dist;
-            }
-            min_dists[n] = current;
-
-            if (current > best_val ||
-                (current == best_val && n < best_idx)) {
-                best_val = current;
-                best_idx = n;
+            // Update minimum distance
+            if (dist < min_dists[n]) {
+                min_dists[n] = dist;
             }
         }
 
-        last = best_idx;
+        // Record selection (matches: idx[:, i] = last)
+        out_indices[i] = last;
+
+        // Find next farthest point (matches: last = torch.argmax(min_dists, dim=1))
+        if (i + 1 < K) {
+            acc_t best_val = neg_inf;
+            int64_t best_idx = 0;
+
+            for (int64_t n = 0; n < N; ++n) {
+                // argmax over all points (invalids have 0.0, selected have 0.0 after update)
+                if (min_dists[n] > best_val ||
+                    (min_dists[n] == best_val && n < best_idx)) {
+                    best_val = min_dists[n];
+                    best_idx = n;
+                }
+            }
+
+            last = best_idx;
+        }
     }
 }
 
