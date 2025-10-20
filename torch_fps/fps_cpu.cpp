@@ -25,6 +25,7 @@ void fps_kernel_cpu(
 
     int64_t valid_count = 0;
     const acc_t inf = std::numeric_limits<acc_t>::infinity();
+    const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
 
     for (int64_t n = 0; n < N; ++n) {
         if (mask[n]) {
@@ -49,6 +50,9 @@ void fps_kernel_cpu(
 
     for (int64_t i = 0; i < K; ++i) {
         out_indices[i] = last;
+        if (mask[last]) {
+            min_dists[last] = neg_inf;
+        }
 
         if (i + 1 >= effective_k) {
             continue;

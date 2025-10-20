@@ -47,6 +47,7 @@ __global__ void fps_kernel_cuda(
     __syncthreads();
 
     const acc_t inf = std::numeric_limits<acc_t>::infinity();
+    const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
 
     int64_t local_count = 0;
     for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
@@ -89,6 +90,9 @@ __global__ void fps_kernel_cuda(
     for (int64_t i = 0; i < K; ++i) {
         if (threadIdx.x == 0) {
             batch_idx[i] = last;
+            if (batch_mask[last]) {
+                batch_min_dists[last] = neg_inf;
+            }
         }
         __syncthreads();
 

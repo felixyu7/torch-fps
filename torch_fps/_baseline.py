@@ -58,14 +58,16 @@ def batched_fps_baseline(
     idx = torch.zeros((B, K), device=device, dtype=torch.long)
 
     inf = torch.tensor(float("inf"), device=device, dtype=dtype)
+    neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
     min_dists = torch.full((B, N), inf, device=device, dtype=dtype)
-    min_dists.masked_fill_(~valid_mask, 0.0)
+    min_dists.masked_fill_(~valid_mask, neg_inf)
 
     last = start_idx
     batch_indices = torch.arange(B, device=device)
 
     for i in range(K):
         idx[:, i] = last
+        min_dists[batch_indices, last] = neg_inf
 
         if i + 1 >= K:
             continue
