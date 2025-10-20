@@ -112,7 +112,8 @@ void fps_with_knn_kernel_cpu(
     int64_t* out_neighbor_indices) {  // [K, k_neighbors]
 
     std::vector<acc_t> min_dists(static_cast<size_t>(N));
-    std::vector<acc_t> all_dists(static_cast<size_t>(K * N));  // Store distances for kNN
+    // Incremental kNN tracking: one buffer per centroid
+    std::vector<std::vector<std::pair<acc_t, int64_t>>> knn_buffers(static_cast<size_t>(K));
 
     int64_t valid_count = 0;
     const acc_t inf = std::numeric_limits<acc_t>::infinity();
@@ -125,6 +126,11 @@ void fps_with_knn_kernel_cpu(
         } else {
             min_dists[n] = acc_t(0);
         }
+    }
+
+    // Pre-allocate kNN buffers
+    for (int64_t i = 0; i < K; ++i) {
+        knn_buffers[i].reserve(static_cast<size_t>(k_neighbors));
     }
 
     const int64_t effective_k = std::min<int64_t>(valid_count, K);
@@ -141,30 +147,40 @@ void fps_with_knn_kernel_cpu(
         return;
     }
 
-    // FPS loop - store distances as we go
+    // FPS loop with incremental kNN tracking
     for (int64_t i = 0; i < K; ++i) {
         const scalar_t* centroid = points + last * D;
+        auto& knn_buffer = knn_buffers[i];
 
         for (int64_t n = 0; n < N; ++n) {
-            acc_t dist;
             if (!mask[n]) {
-                // Invalid points get inf distance (will be filtered in kNN)
-                dist = inf;
-            } else {
-                const scalar_t* point = points + n * D;
-                dist = acc_t(0);
-                for (int64_t d = 0; d < D; ++d) {
-                    const acc_t diff =
-                        static_cast<acc_t>(point[d]) - static_cast<acc_t>(centroid[d]);
-                    dist += diff * diff;
-                }
+                continue;  // Skip invalid points entirely
             }
 
-            // Store distance for kNN
-            all_dists[i * N + n] = dist;
+            const scalar_t* point = points + n * D;
+            acc_t dist = acc_t(0);
+            for (int64_t d = 0; d < D; ++d) {
+                const acc_t diff =
+                    static_cast<acc_t>(point[d]) - static_cast<acc_t>(centroid[d]);
+                dist += diff * diff;
+            }
 
-            // Update minimum distance for FPS (skip invalid points)
-            if (mask[n] && dist < min_dists[n]) {
+            // Incremental kNN tracking using max-heap
+            // Heap property: largest distance at front
+            if (knn_buffer.size() < static_cast<size_t>(k_neighbors)) {
+                knn_buffer.push_back({dist, n});
+                if (knn_buffer.size() == static_cast<size_t>(k_neighbors)) {
+                    std::make_heap(knn_buffer.begin(), knn_buffer.end());
+                }
+            } else if (dist < knn_buffer.front().first) {
+                // Replace the farthest neighbor with this closer one
+                std::pop_heap(knn_buffer.begin(), knn_buffer.end());
+                knn_buffer.back() = {dist, n};
+                std::push_heap(knn_buffer.begin(), knn_buffer.end());
+            }
+
+            // Update minimum distance for FPS
+            if (dist < min_dists[n]) {
                 min_dists[n] = dist;
             }
         }
@@ -189,29 +205,23 @@ void fps_with_knn_kernel_cpu(
         }
     }
 
-    // kNN extraction: for each centroid, find k nearest neighbors
+    // Extract neighbor indices from kNN buffers
     for (int64_t i = 0; i < K; ++i) {
-        // Create a vector of (distance, index) pairs
-        std::vector<std::pair<acc_t, int64_t>> dist_idx_pairs;
-        dist_idx_pairs.reserve(N);
+        const auto& knn_buffer = knn_buffers[i];
+        const int64_t k_actual = std::min<int64_t>(
+            k_neighbors,
+            static_cast<int64_t>(knn_buffer.size())
+        );
 
-        for (int64_t n = 0; n < N; ++n) {
-            dist_idx_pairs.emplace_back(all_dists[i * N + n], n);
+        // Copy neighbor indices (unsorted order is acceptable)
+        for (int64_t k = 0; k < k_actual; ++k) {
+            out_neighbor_indices[i * k_neighbors + k] = knn_buffer[k].second;
         }
 
-        // Partial sort to get k smallest
-        const int64_t k_eff = std::min<int64_t>(k_neighbors, N);
-        std::partial_sort(
-            dist_idx_pairs.begin(),
-            dist_idx_pairs.begin() + k_eff,
-            dist_idx_pairs.end(),
-            [](const std::pair<acc_t, int64_t>& a, const std::pair<acc_t, int64_t>& b) {
-                return a.first < b.first;  // Sort by distance (ascending)
-            });
-
-        // Extract indices
-        for (int64_t k = 0; k < k_neighbors; ++k) {
-            out_neighbor_indices[i * k_neighbors + k] = dist_idx_pairs[k].second;
+        // Fill remaining slots if we have fewer than k_neighbors valid points
+        // Use the centroid itself as fallback
+        for (int64_t k = k_actual; k < k_neighbors; ++k) {
+            out_neighbor_indices[i * k_neighbors + k] = out_centroid_indices[i];
         }
     }
 }

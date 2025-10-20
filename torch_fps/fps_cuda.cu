@@ -172,7 +172,7 @@ __global__ void fps_kernel_cuda(
 }
 
 // ============================================================================
-// Fused FPS + kNN kernel
+// Fused FPS + kNN kernel (optimized: compute distances during FPS)
 // ============================================================================
 
 template <typename scalar_t, typename acc_t, int BLOCK_SIZE, int MAX_D>
@@ -186,7 +186,7 @@ __global__ void fps_with_knn_kernel_cuda(
     int64_t K,
     int64_t* __restrict__ idx,
     acc_t* __restrict__ min_dists,
-    acc_t* __restrict__ all_dists) {  // NEW: store all centroid distances [B, K, N]
+    acc_t* __restrict__ all_dists) {  // Store all centroid distances [B, K, N]
     const int b = blockIdx.x;
     if (b >= B) {
         return;
@@ -254,7 +254,7 @@ __global__ void fps_with_knn_kernel_cuda(
         // All threads read the current selection from shared memory
         last = shared_last;
 
-        // Phase 1: Update min_dists based on distance to current centroid
+        // Compute distances to current centroid
         acc_t centroid_vals[MAX_D];
         for (int64_t d = 0; d < D; ++d) {
             centroid_vals[d] = static_cast<acc_t>(batch_points[last * D + d]);
@@ -275,7 +275,7 @@ __global__ void fps_with_knn_kernel_cuda(
                 }
             }
 
-            // NEW: Store distance for kNN
+            // Store distance for kNN (to be processed by topk later)
             batch_all_dists[i * N + n] = dist;
 
             // Update minimum distance for FPS (skip invalid points)
@@ -475,9 +475,8 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
 
         AT_CUDA_CHECK(cudaGetLastError());
 
-        // Perform topk to get k nearest neighbors for each centroid
-        // all_dists: [B, K, N], we want the k smallest distances per centroid
-        auto topk_result = at::topk(all_dists, k_neighbors, /*dim=*/-1, /*largest=*/false, /*sorted=*/true);
+        // Use PyTorch's optimized topk for kNN selection
+        auto topk_result = at::topk(all_dists, k_neighbors, /*dim=*/-1, /*largest=*/false, /*sorted=*/false);
         neighbor_idx = std::get<1>(topk_result);  // [B, K, k_neighbors]
     });
 
