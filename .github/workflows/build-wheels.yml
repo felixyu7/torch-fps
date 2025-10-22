@@ -9,7 +9,7 @@ on:
 jobs:
   build_wheels:
     name: Build wheel for Python ${{ matrix.python-version }} CUDA ${{ matrix.cuda-version }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ['3.11', '3.12']
