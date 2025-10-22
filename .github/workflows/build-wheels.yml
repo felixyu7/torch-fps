@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         python-version: ['3.11', '3.12']
-        cuda-version: ['12.1', '12.4', '12.8']
+        cuda-version: ['12.1.0', '12.4.0', '12.8.0']
       fail-fast: false  # Continue building other wheels even if one fails
 
     steps:
@@ -40,15 +40,17 @@ jobs:
 
       - name: Install PyTorch with CUDA ${{ matrix.cuda-version }}
         run: |
+          # Extract major.minor version (e.g., "12.1.0" -> "12.1")
+          CUDA_VERSION="${{ matrix.cuda-version }}"
+          CUDA_MINOR=$(echo "$CUDA_VERSION" | cut -d'.' -f1,2)
+
           # Map CUDA version to PyTorch wheel URL
-          CUDA_SHORT=$(echo "${{ matrix.cuda-version }}" | tr -d '.')
-          if [ "${{ matrix.cuda-version }}" = "12.1" ]; then
+          if [ "$CUDA_MINOR" = "12.1" ]; then
             TORCH_INDEX="https://download.pytorch.org/whl/cu121"
-          elif [ "${{ matrix.cuda-version }}" = "12.4" ]; then
+          elif [ "$CUDA_MINOR" = "12.4" ]; then
             TORCH_INDEX="https://download.pytorch.org/whl/cu124"
-          elif [ "${{ matrix.cuda-version }}" = "12.8" ]; then
-            # PyTorch doesn't have cu128 yet, use cu124 as fallback
-            TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+          elif [ "$CUDA_MINOR" = "12.8" ]; then
+            TORCH_INDEX="https://download.pytorch.org/whl/cu128"
           else
             TORCH_INDEX="https://download.pytorch.org/whl/cu121"
           fi
