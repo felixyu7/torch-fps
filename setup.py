@@ -60,6 +60,27 @@ def get_extensions():
         extra_compile_args["nvcc"] = ["-O3", "-DWITH_CUDA"]
         if sys.platform == "darwin":
             extra_compile_args["nvcc"].extend(["-Xcompiler", "-stdlib=libc++"])
+
+        # Configure CUDA architectures for multi-GPU support
+        cuda_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+        if cuda_arch_list:
+            # User specified architectures
+            arch_list = cuda_arch_list.split(";") if ";" in cuda_arch_list else cuda_arch_list.split()
+        else:
+            # Default: support modern architectures
+            arch_list = ["8.0", "8.6", "8.9", "9.0", "10.0", "12.0"]
+
+        for arch in arch_list:
+            arch_clean = arch.replace(".", "")
+            # Generate both compute and SM code for maximum compatibility
+            extra_compile_args["nvcc"].extend([
+                f"-gencode", f"arch=compute_{arch_clean},code=sm_{arch_clean}"
+            ])
+        # Add PTX for forward compatibility with future architectures
+        last_arch = arch_list[-1].replace(".", "")
+        extra_compile_args["nvcc"].extend([
+            f"-gencode", f"arch=compute_{last_arch},code=compute_{last_arch}"
+        ])
         extensions.append(
             CUDAExtension(
                 name="torch_fps._C",

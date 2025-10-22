@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-fps"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native PyTorch farthest point sampling for point cloud workloads"
 readme = "README.md"
 license = { file = "LICENSE" }
