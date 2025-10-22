@@ -5,6 +5,7 @@ Optimized standard farthest point sampling (FPS) for PyTorch written in C++.
 ```bash
 pip install torch-fps
 ```
+**Note**: Ensure gcc > 9 and < 14.
 
 ## Usage
 
