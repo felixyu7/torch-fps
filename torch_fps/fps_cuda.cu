@@ -14,7 +14,7 @@
 namespace torch_fps {
 namespace {
 
-template <typename scalar_t, typename acc_t, int BLOCK_SIZE, int MAX_D>
+template <typename scalar_t, typename acc_t, int BLOCK_SIZE>
 __global__ void fps_kernel_cuda(
     const scalar_t* __restrict__ points,
     const bool* __restrict__ mask,
@@ -25,6 +25,9 @@ __global__ void fps_kernel_cuda(
     int64_t K,
     int64_t* __restrict__ idx,
     acc_t* __restrict__ min_dists) {
+    extern __shared__ unsigned char shared_storage[];
+    acc_t* centroid_vals = reinterpret_cast<acc_t*>(shared_storage);
+
     const int b = blockIdx.x;
     if (b >= B) {
         return;
@@ -91,14 +94,15 @@ __global__ void fps_kernel_cuda(
         // All threads read the current selection from shared memory
         last = shared_last;
 
+        // Load centroid coordinates into shared memory for reuse
+        for (int64_t d = threadIdx.x; d < D; d += BLOCK_SIZE) {
+            centroid_vals[d] = static_cast<acc_t>(batch_points[last * D + d]);
+        }
+        __syncthreads();
+
         // Phase 1: Update min_dists based on distance to current centroid
         // This matches: d = (points - c[:, None, :]).square().sum(dim=2)
         //               min_dists = torch.minimum(min_dists, d)
-        acc_t centroid_vals[MAX_D];
-        for (int64_t d = 0; d < D; ++d) {
-            centroid_vals[d] = static_cast<acc_t>(batch_points[last * D + d]);
-        }
-
         for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
             if (!batch_mask[n]) {
                 continue;  // Skip distance computation for invalid points
@@ -175,7 +179,7 @@ __global__ void fps_kernel_cuda(
 // Fused FPS + kNN kernel (optimized: compute distances during FPS)
 // ============================================================================
 
-template <typename scalar_t, typename acc_t, int BLOCK_SIZE, int MAX_D>
+template <typename scalar_t, typename acc_t, int BLOCK_SIZE>
 __global__ void fps_with_knn_kernel_cuda(
     const scalar_t* __restrict__ points,
     const bool* __restrict__ mask,
@@ -187,6 +191,9 @@ __global__ void fps_with_knn_kernel_cuda(
     int64_t* __restrict__ idx,
     acc_t* __restrict__ min_dists,
     acc_t* __restrict__ all_dists) {  // Store all centroid distances [B, K, N]
+    extern __shared__ unsigned char shared_storage[];
+    acc_t* centroid_vals = reinterpret_cast<acc_t*>(shared_storage);
+
     const int b = blockIdx.x;
     if (b >= B) {
         return;
@@ -255,10 +262,10 @@ __global__ void fps_with_knn_kernel_cuda(
         last = shared_last;
 
         // Compute distances to current centroid
-        acc_t centroid_vals[MAX_D];
-        for (int64_t d = 0; d < D; ++d) {
+        for (int64_t d = threadIdx.x; d < D; d += BLOCK_SIZE) {
             centroid_vals[d] = static_cast<acc_t>(batch_points[last * D + d]);
         }
+        __syncthreads();
 
         for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
             acc_t dist;
@@ -368,16 +375,12 @@ at::Tensor fps_forward_cuda(
     const auto N = points_contig.size(1);
     const auto D = points_contig.size(2);
 
-    TORCH_CHECK(D <= 16,
-                "torch-fps CUDA kernel supports up to 16 feature dimensions");
-
     auto idx = at::empty({B, K},
                          at::TensorOptions()
                              .dtype(at::kLong)
                              .device(points_contig.device()));
 
     constexpr int BLOCK_SIZE = 256;
-    constexpr int MAX_D = 16;
     const dim3 blocks(static_cast<unsigned int>(B));
 
     AT_DISPATCH_FLOATING_TYPES(points_contig.scalar_type(), "fps_forward_cuda", [&] {
@@ -386,8 +389,10 @@ at::Tensor fps_forward_cuda(
             std::is_same<acc_t, double>::value ? at::kDouble : at::kFloat;
         auto min_dists =
             at::empty({B, N}, points_contig.options().dtype(acc_scalar_type));
-        fps_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE, MAX_D>
-            <<<blocks, BLOCK_SIZE, 0, at::cuda::getCurrentCUDAStream()>>>(
+        const size_t shared_mem_bytes =
+            static_cast<size_t>(D) * sizeof(acc_t);
+        fps_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE>
+            <<<blocks, BLOCK_SIZE, shared_mem_bytes, at::cuda::getCurrentCUDAStream()>>>(
                 points_contig.data_ptr<scalar_t>(),
                 mask_contig.data_ptr<bool>(),
                 start_contig.data_ptr<int64_t>(),
@@ -436,8 +441,6 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
     const auto N = points_contig.size(1);
     const auto D = points_contig.size(2);
 
-    TORCH_CHECK(D <= 16,
-                "torch-fps CUDA kernel supports up to 16 feature dimensions");
     TORCH_CHECK(k_neighbors <= N,
                 "k_neighbors must be <= N (number of points)");
 
@@ -447,7 +450,6 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
                                        .device(points_contig.device()));
 
     constexpr int BLOCK_SIZE = 256;
-    constexpr int MAX_D = 16;
     const dim3 blocks(static_cast<unsigned int>(B));
 
     at::Tensor neighbor_idx;
@@ -460,8 +462,10 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
         auto min_dists = at::empty({B, N}, points_contig.options().dtype(acc_scalar_type));
         auto all_dists = at::empty({B, K, N}, points_contig.options().dtype(acc_scalar_type));
 
-        fps_with_knn_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE, MAX_D>
-            <<<blocks, BLOCK_SIZE, 0, at::cuda::getCurrentCUDAStream()>>>(
+        const size_t shared_mem_bytes =
+            static_cast<size_t>(D) * sizeof(acc_t);
+        fps_with_knn_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE>
+            <<<blocks, BLOCK_SIZE, shared_mem_bytes, at::cuda::getCurrentCUDAStream()>>>(
                 points_contig.data_ptr<scalar_t>(),
                 mask_contig.data_ptr<bool>(),
                 start_contig.data_ptr<int64_t>(),
