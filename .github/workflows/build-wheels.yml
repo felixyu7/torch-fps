@@ -31,7 +31,6 @@ jobs:
         with:
           cuda: ${{ matrix.cuda-version }}
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cudart-dev"]'
 
       - name: Verify CUDA installation
         run: |
