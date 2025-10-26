@@ -19,6 +19,7 @@ def farthest_point_sampling(
     start_idx: Optional[Tensor] = None,
     random_start: bool = True,
     generator: Optional[torch.Generator] = None,
+    precision: Optional[torch.dtype] = None,
 ) -> Tensor:
     """
     Farthest point sampling with native CPU/CUDA acceleration.
@@ -38,6 +39,10 @@ def farthest_point_sampling(
             first index from valid points.
         generator:
             Optional `torch.Generator` used for deterministic random starts.
+        precision:
+            Optional dtype for internal computations. If None (default), uses float32 on all
+            devices for numerical stability. Can override: float16, float32, float64 (CPU/GPU)
+            or bfloat16 (GPU only).
 
     Returns:
         idx:
@@ -58,7 +63,20 @@ def farthest_point_sampling(
         return torch.zeros((B, 0), device=device, dtype=torch.long)
 
     device = points.device
-    dtype = points.dtype
+
+    # Determine precision: default to float32 on all devices for stability
+    if precision is None:
+        dtype = torch.float32
+        if points.dtype != torch.float32:
+            points = points.to(dtype=torch.float32)
+    else:
+        dtype = precision
+        # Validate precision
+        if device.type == 'cpu' and precision == torch.bfloat16:
+            raise ValueError("bfloat16 is not supported on CPU (use float16, float32, or float64)")
+        # Convert points to specified precision
+        if points.dtype != precision:
+            points = points.to(dtype=precision)
 
     if valid_mask.device != device:
         valid_mask = valid_mask.to(device)
@@ -140,6 +158,7 @@ def farthest_point_sampling_with_knn(
     start_idx: Optional[Tensor] = None,
     random_start: bool = True,
     generator: Optional[torch.Generator] = None,
+    precision: Optional[torch.dtype] = None,
 ) -> tuple[Tensor, Tensor]:
     """
     Fused farthest point sampling + k-nearest neighbors with native CPU/CUDA acceleration.
@@ -166,6 +185,10 @@ def farthest_point_sampling_with_knn(
             first index from valid points.
         generator:
             Optional `torch.Generator` used for deterministic random starts.
+        precision:
+            Optional dtype for internal computations. If None (default), uses float32 on all
+            devices for numerical stability. Can override: float16, float32, float64 (CPU/GPU)
+            or bfloat16 (GPU only).
 
     Returns:
         centroid_idx:
@@ -198,7 +221,20 @@ def farthest_point_sampling_with_knn(
 
     B, N, D = points.shape
     device = points.device
-    dtype = points.dtype
+
+    # Determine precision: default to float32 on all devices for stability
+    if precision is None:
+        dtype = torch.float32
+        if points.dtype != torch.float32:
+            points = points.to(dtype=torch.float32)
+    else:
+        dtype = precision
+        # Validate precision
+        if device.type == 'cpu' and precision == torch.bfloat16:
+            raise ValueError("bfloat16 is not supported on CPU (use float16, float32, or float64)")
+        # Convert points to specified precision
+        if points.dtype != precision:
+            points = points.to(dtype=precision)
 
     if K == 0:
         centroid_idx = torch.zeros((B, 0), device=device, dtype=torch.long)

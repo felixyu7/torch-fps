@@ -33,9 +33,9 @@ class TestFPS:
         mask = torch.ones(B, N, dtype=torch.bool, device=device)
         start_idx = torch.zeros(B, dtype=torch.long, device=device)
 
-        # Optimized version
+        # Optimized version (use fp32 for exact comparison with baseline)
         idx_opt = farthest_point_sampling(
-            points, mask, K, start_idx=start_idx, random_start=False
+            points, mask, K, start_idx=start_idx, random_start=False, precision=torch.float32
         )
 
         # Baseline version
@@ -65,7 +65,7 @@ class TestFPS:
         start_idx = torch.zeros(B, dtype=torch.long, device=device)
 
         idx_opt = farthest_point_sampling(
-            points, mask, K, start_idx=start_idx, random_start=False
+            points, mask, K, start_idx=start_idx, random_start=False, precision=torch.float32
         )
         idx_base = fps_baseline(points, mask, K, start_idx)
 
@@ -84,12 +84,12 @@ class TestFPS:
         start_idx = torch.zeros(B, dtype=torch.long, device=device)
 
         # K = 1
-        idx_opt = farthest_point_sampling(points, mask, 1, start_idx=start_idx, random_start=False)
+        idx_opt = farthest_point_sampling(points, mask, 1, start_idx=start_idx, random_start=False, precision=torch.float32)
         idx_base = fps_baseline(points, mask, 1, start_idx)
         assert torch.equal(idx_opt, idx_base)
 
         # K = N
-        idx_opt = farthest_point_sampling(points, mask, N, start_idx=start_idx, random_start=False)
+        idx_opt = farthest_point_sampling(points, mask, N, start_idx=start_idx, random_start=False, precision=torch.float32)
         idx_base = fps_baseline(points, mask, N, start_idx)
         assert torch.equal(idx_opt, idx_base)
 
@@ -117,9 +117,9 @@ class TestFPSWithKNN:
         mask = torch.ones(B, N, dtype=torch.bool, device=device)
         start_idx = torch.zeros(B, dtype=torch.long, device=device)
 
-        # Fused version
+        # Fused version (use fp32 for exact comparison with baseline)
         centroid_idx_fused, neighbor_idx_fused = farthest_point_sampling_with_knn(
-            points, mask, K, k, start_idx=start_idx, random_start=False
+            points, mask, K, k, start_idx=start_idx, random_start=False, precision=torch.float32
         )
 
         # Baseline (separate FPS + kNN)
@@ -155,7 +155,7 @@ class TestFPSWithKNN:
         start_idx = torch.zeros(B, dtype=torch.long, device=device)
 
         centroid_idx_fused, neighbor_idx_fused = farthest_point_sampling_with_knn(
-            points, mask, K, k, start_idx=start_idx, random_start=False
+            points, mask, K, k, start_idx=start_idx, random_start=False, precision=torch.float32
         )
         centroid_idx_base, neighbor_idx_base = fps_with_knn_baseline(
             points, mask, K, k, start_idx
@@ -180,7 +180,7 @@ class TestFPSWithKNN:
 
         # k = 1
         centroid_idx_fused, neighbor_idx_fused = farthest_point_sampling_with_knn(
-            points, mask, K, 1, start_idx=start_idx, random_start=False
+            points, mask, K, 1, start_idx=start_idx, random_start=False, precision=torch.float32
         )
         centroid_idx_base, neighbor_idx_base = fps_with_knn_baseline(
             points, mask, K, 1, start_idx
@@ -194,7 +194,7 @@ class TestFPSWithKNN:
 
         # k = N (maximum neighbors)
         centroid_idx_fused, neighbor_idx_fused = farthest_point_sampling_with_knn(
-            points, mask, K, N, start_idx=start_idx, random_start=False
+            points, mask, K, N, start_idx=start_idx, random_start=False, precision=torch.float32
         )
         centroid_idx_base, neighbor_idx_base = fps_with_knn_baseline(
             points, mask, K, N, start_idx
@@ -227,11 +227,11 @@ class TestDeterminism:
         points = torch.randn(B, N, D, device=device)
         mask = torch.ones(B, N, dtype=torch.bool, device=device)
         gen1 = torch.Generator(device=device).manual_seed(123)
-        idx1 = farthest_point_sampling(points, mask, K, generator=gen1)
+        idx1 = farthest_point_sampling(points, mask, K, generator=gen1, precision=torch.float32)
 
         # Run 2 (same seed)
         gen2 = torch.Generator(device=device).manual_seed(123)
-        idx2 = farthest_point_sampling(points, mask, K, generator=gen2)
+        idx2 = farthest_point_sampling(points, mask, K, generator=gen2, precision=torch.float32)
 
         assert torch.equal(idx1, idx2), "FPS not deterministic with same seed"
 
@@ -248,11 +248,11 @@ class TestDeterminism:
         points = torch.randn(B, N, D, device=device)
         mask = torch.ones(B, N, dtype=torch.bool, device=device)
         gen1 = torch.Generator(device=device).manual_seed(123)
-        cent1, neigh1 = farthest_point_sampling_with_knn(points, mask, K, k, generator=gen1)
+        cent1, neigh1 = farthest_point_sampling_with_knn(points, mask, K, k, generator=gen1, precision=torch.float32)
 
         # Run 2 (same seed)
         gen2 = torch.Generator(device=device).manual_seed(123)
-        cent2, neigh2 = farthest_point_sampling_with_knn(points, mask, K, k, generator=gen2)
+        cent2, neigh2 = farthest_point_sampling_with_knn(points, mask, K, k, generator=gen2, precision=torch.float32)
 
         assert torch.equal(cent1, cent2), "Centroids not deterministic"
         assert torch.equal(neigh1, neigh2), "Neighbors not deterministic"

@@ -188,9 +188,11 @@ __global__ void fps_with_knn_kernel_cuda(
     int64_t N,
     int64_t D,
     int64_t K,
+    int64_t k_neighbors,
     int64_t* __restrict__ idx,
+    int64_t* __restrict__ neighbor_idx,
     acc_t* __restrict__ min_dists,
-    acc_t* __restrict__ all_dists) {  // Store all centroid distances [B, K, N]
+    acc_t* __restrict__ curr_dists) {
     extern __shared__ unsigned char shared_storage[];
     acc_t* centroid_vals = reinterpret_cast<acc_t*>(shared_storage);
 
@@ -203,8 +205,9 @@ __global__ void fps_with_knn_kernel_cuda(
     const bool* batch_mask = mask + static_cast<int64_t>(b) * N;
     const int64_t start = start_idx[b];
     int64_t* batch_idx = idx + static_cast<int64_t>(b) * K;
+    int64_t* batch_neighbors = neighbor_idx + static_cast<int64_t>(b) * K * k_neighbors;
     acc_t* batch_min_dists = min_dists + static_cast<int64_t>(b) * N;
-    acc_t* batch_all_dists = all_dists + static_cast<int64_t>(b) * K * N;  // [K, N]
+    acc_t* batch_curr_dists = curr_dists + static_cast<int64_t>(b) * N;
 
     __shared__ int64_t shared_last;
     __shared__ int64_t shared_counts[BLOCK_SIZE];
@@ -282,8 +285,8 @@ __global__ void fps_with_knn_kernel_cuda(
                 }
             }
 
-            // Store distance for kNN (to be processed by topk later)
-            batch_all_dists[i * N + n] = dist;
+            // Store distance for kNN selection
+            batch_curr_dists[n] = dist;
 
             // Update minimum distance for FPS (skip invalid points)
             if (batch_mask[n] && dist < batch_min_dists[n]) {
@@ -297,6 +300,47 @@ __global__ void fps_with_knn_kernel_cuda(
             batch_idx[i] = last;
         }
         __syncthreads();
+
+        // Streaming kNN selection for the current centroid
+        for (int64_t nn = 0; nn < k_neighbors; ++nn) {
+            acc_t best_val = inf;
+            int64_t best_idx = 0;
+
+            for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
+                const acc_t val = batch_curr_dists[n];
+                if (val < best_val || (val == best_val && n < best_idx)) {
+                    best_val = val;
+                    best_idx = n;
+                }
+            }
+
+            shared_vals[threadIdx.x] = best_val;
+            shared_idx[threadIdx.x] = best_idx;
+            __syncthreads();
+
+            for (int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1) {
+                if (threadIdx.x < offset) {
+                    const acc_t other_val = shared_vals[threadIdx.x + offset];
+                    const int64_t other_idx = shared_idx[threadIdx.x + offset];
+                    const acc_t current_val = shared_vals[threadIdx.x];
+                    const int64_t current_idx = shared_idx[threadIdx.x];
+
+                    if (other_val < current_val ||
+                        (other_val == current_val && other_idx < current_idx)) {
+                        shared_vals[threadIdx.x] = other_val;
+                        shared_idx[threadIdx.x] = other_idx;
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (threadIdx.x == 0) {
+                const int64_t chosen = shared_idx[0];
+                batch_neighbors[i * k_neighbors + nn] = chosen;
+                batch_curr_dists[chosen] = inf;
+            }
+            __syncthreads();
+        }
 
         // Find next farthest point (matches: last = torch.argmax(min_dists, dim=1))
         if (i + 1 < K) {
@@ -360,8 +404,9 @@ at::Tensor fps_forward_cuda(
     TORCH_CHECK(start_idx.numel() == points.size(0),
                 "start_idx tensor must have shape [B]");
 
-    TORCH_CHECK(points.scalar_type() == at::kFloat || points.scalar_type() == at::kDouble,
-                "points tensor must be float32 or float64");
+    TORCH_CHECK(points.scalar_type() == at::kFloat || points.scalar_type() == at::kDouble ||
+                points.scalar_type() == at::kBFloat16 || points.scalar_type() == at::kHalf,
+                "points tensor must be float16, bfloat16, float32, or float64");
     TORCH_CHECK(mask.scalar_type() == at::kBool,
                 "mask tensor must be boolean");
 
@@ -383,12 +428,10 @@ at::Tensor fps_forward_cuda(
     constexpr int BLOCK_SIZE = 256;
     const dim3 blocks(static_cast<unsigned int>(B));
 
-    AT_DISPATCH_FLOATING_TYPES(points_contig.scalar_type(), "fps_forward_cuda", [&] {
-        using acc_t = at::acc_type<scalar_t, true>;
-        const at::ScalarType acc_scalar_type =
-            std::is_same<acc_t, double>::value ? at::kDouble : at::kFloat;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, points_contig.scalar_type(), "fps_forward_cuda", [&] {
+        using acc_t = scalar_t;  // Keep original precision (bf16, fp16, fp32, or fp64)
         auto min_dists =
-            at::empty({B, N}, points_contig.options().dtype(acc_scalar_type));
+            at::empty({B, N}, points_contig.options());
         const size_t shared_mem_bytes =
             static_cast<size_t>(D) * sizeof(acc_t);
         fps_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE>
@@ -425,8 +468,9 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
     TORCH_CHECK(start_idx.numel() == points.size(0),
                 "start_idx tensor must have shape [B]");
 
-    TORCH_CHECK(points.scalar_type() == at::kFloat || points.scalar_type() == at::kDouble,
-                "points tensor must be float32 or float64");
+    TORCH_CHECK(points.scalar_type() == at::kFloat || points.scalar_type() == at::kDouble ||
+                points.scalar_type() == at::kBFloat16 || points.scalar_type() == at::kHalf,
+                "points tensor must be float16, bfloat16, float32, or float64");
     TORCH_CHECK(mask.scalar_type() == at::kBool,
                 "mask tensor must be boolean");
 
@@ -452,15 +496,16 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
     constexpr int BLOCK_SIZE = 256;
     const dim3 blocks(static_cast<unsigned int>(B));
 
-    at::Tensor neighbor_idx;
+    auto neighbor_idx = at::empty({B, K, k_neighbors},
+                                  at::TensorOptions()
+                                      .dtype(at::kLong)
+                                      .device(points_contig.device()));
 
-    AT_DISPATCH_FLOATING_TYPES(points_contig.scalar_type(), "fps_with_knn_forward_cuda", [&] {
-        using acc_t = at::acc_type<scalar_t, true>;
-        const at::ScalarType acc_scalar_type =
-            std::is_same<acc_t, double>::value ? at::kDouble : at::kFloat;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, points_contig.scalar_type(), "fps_with_knn_forward_cuda", [&] {
+        using acc_t = scalar_t;  // Keep original precision (bf16, fp16, fp32, or fp64)
 
-        auto min_dists = at::empty({B, N}, points_contig.options().dtype(acc_scalar_type));
-        auto all_dists = at::empty({B, K, N}, points_contig.options().dtype(acc_scalar_type));
+        auto min_dists = at::empty({B, N}, points_contig.options());
+        auto curr_dists = at::empty({B, N}, points_contig.options());
 
         const size_t shared_mem_bytes =
             static_cast<size_t>(D) * sizeof(acc_t);
@@ -473,15 +518,13 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
                 N,
                 D,
                 K,
+                k_neighbors,
                 centroid_idx.data_ptr<int64_t>(),
+                neighbor_idx.data_ptr<int64_t>(),
                 min_dists.data_ptr<acc_t>(),
-                all_dists.data_ptr<acc_t>());
+                curr_dists.data_ptr<acc_t>());
 
         AT_CUDA_CHECK(cudaGetLastError());
-
-        // Use PyTorch's optimized topk for kNN selection
-        auto topk_result = at::topk(all_dists, k_neighbors, /*dim=*/-1, /*largest=*/false, /*sorted=*/false);
-        neighbor_idx = std::get<1>(topk_result);  // [B, K, k_neighbors]
     });
 
     return std::make_tuple(centroid_idx, neighbor_idx);

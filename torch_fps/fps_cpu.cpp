@@ -242,8 +242,9 @@ at::Tensor fps_forward_cpu(
     TORCH_CHECK(start_idx.numel() == points.size(0),
                 "start_idx tensor must have shape [B]");
 
-    TORCH_CHECK(points.scalar_type() == at::kFloat || points.scalar_type() == at::kDouble,
-                "points tensor must be float32 or float64");
+    TORCH_CHECK(points.scalar_type() == at::kFloat || points.scalar_type() == at::kDouble ||
+                points.scalar_type() == at::kHalf,
+                "points tensor must be float16, float32, or float64 (bfloat16 only supported on CUDA)");
 
     TORCH_CHECK(mask.scalar_type() == at::kBool,
                 "mask tensor must be boolean");
@@ -261,8 +262,8 @@ at::Tensor fps_forward_cpu(
                                       .dtype(at::kLong)
                                       .device(points_contig.device()));
 
-    AT_DISPATCH_FLOATING_TYPES(points_contig.scalar_type(), "fps_forward_cpu", [&] {
-        using acc_t = at::acc_type<scalar_t, true>;
+    AT_DISPATCH_FLOATING_TYPES_AND(at::kHalf, points_contig.scalar_type(), "fps_forward_cpu", [&] {
+        using acc_t = scalar_t;  // Keep original precision (fp16, fp32, or fp64)
 
         const scalar_t* points_ptr = points_contig.data_ptr<scalar_t>();
         const bool* mask_ptr = mask_contig.data_ptr<bool>();
@@ -306,8 +307,9 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cpu(
     TORCH_CHECK(start_idx.numel() == points.size(0),
                 "start_idx tensor must have shape [B]");
 
-    TORCH_CHECK(points.scalar_type() == at::kFloat || points.scalar_type() == at::kDouble,
-                "points tensor must be float32 or float64");
+    TORCH_CHECK(points.scalar_type() == at::kFloat || points.scalar_type() == at::kDouble ||
+                points.scalar_type() == at::kHalf,
+                "points tensor must be float16, float32, or float64 (bfloat16 only supported on CUDA)");
 
     TORCH_CHECK(mask.scalar_type() == at::kBool,
                 "mask tensor must be boolean");
@@ -333,8 +335,8 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cpu(
                                                            .dtype(at::kLong)
                                                            .device(points_contig.device()));
 
-    AT_DISPATCH_FLOATING_TYPES(points_contig.scalar_type(), "fps_with_knn_forward_cpu", [&] {
-        using acc_t = at::acc_type<scalar_t, true>;
+    AT_DISPATCH_FLOATING_TYPES_AND(at::kHalf, points_contig.scalar_type(), "fps_with_knn_forward_cpu", [&] {
+        using acc_t = scalar_t;  // Keep original precision (fp16, fp32, or fp64)
 
         const scalar_t* points_ptr = points_contig.data_ptr<scalar_t>();
         const bool* mask_ptr = mask_contig.data_ptr<bool>();

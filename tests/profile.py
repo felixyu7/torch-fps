@@ -27,26 +27,30 @@ def benchmark_function(func, *args, warmup=3, iterations=10, sync_cuda=True):
         sync_cuda: Whether to synchronize CUDA before timing
 
     Returns:
-        Average time in milliseconds
+        Median time in milliseconds
     """
+    import statistics
+
     # Warmup
     for _ in range(warmup):
         _ = func(*args)
         if sync_cuda and torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    # Timed runs
-    if sync_cuda and torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-    start = time.perf_counter()
+    # Timed runs - time each iteration individually for accuracy
+    times = []
     for _ in range(iterations):
+        if sync_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        start = time.perf_counter()
         _ = func(*args)
         if sync_cuda and torch.cuda.is_available():
             torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+        elapsed = time.perf_counter() - start
+        times.append(elapsed * 1000)  # Convert to ms
 
-    return (elapsed / iterations) * 1000  # Convert to ms
+    return statistics.median(times)  # Use median for robustness
 
 
 # ============================================================================

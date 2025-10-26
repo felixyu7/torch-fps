@@ -32,38 +32,22 @@ centroid_idx, neighbor_idx = farthest_point_sampling_with_knn(
 
 ## Performance
 
-Benchmarked on AMD Threadripper 7970X and NVIDIA RTX 5090. Values show CPU / CUDA measurements.
+Benchmarked on AMD Threadripper 7970X and NVIDIA RTX 5090. Values show CPU / CUDA measurements. By default uses float32; override with `precision=` parameter.
 
 **FPS:**
 
 | B  | N    | K   | Baseline (ms)   | Optimized (ms) | Speedup        |
 |---:|-----:|----:|----------------:|---------------:|---------------:|
-| 4  | 100  | 20  | 0.45 / 1.40     | 0.05 / 0.24    | 8.5x / 5.9x    |
-| 8  | 512  | 64  | 2.85 / 4.04     | 0.66 / 0.31    | 4.3x / 13.0x   |
-| 16 | 1024 | 128 | 33.31 / 7.78    | 4.52 / 0.59    | 7.4x / 13.1x   |
-| 32 | 2048 | 256 | 158.18 / 15.56  | 33.18 / 1.66   | 4.8x / 9.4x    |
+| 4  | 100  | 20  | 0.42 / 1.39     | 0.05 / 0.24    | 8.05x / 5.83x  |
+| 8  | 512  | 64  | 2.75 / 4.01     | 0.63 / 0.31    | 4.36x / 13.11x |
+| 16 | 1024 | 128 | 34.52 / 7.78    | 4.54 / 0.45    | 7.61x / 17.34x |
+| 32 | 2048 | 256 | 153.27 / 15.41  | 36.48 / 0.89   | 4.20x / 17.34x |
 
 **FPS+kNN:**
 
 | B  | N    | K   | k  | Baseline (ms)   | Optimized (ms) | Speedup        |
 |---:|-----:|----:|---:|----------------:|---------------:|---------------:|
-| 4  | 100  | 16  | 8  | 0.43 / 1.21     | 0.08 / 0.24    | 5.4x / 5.0x    |
-| 8  | 512  | 64  | 16 | 4.98 / 4.07     | 2.16 / 0.33    | 2.3x / 12.3x   |
-| 16 | 1024 | 128 | 16 | 39.00 / 7.96    | 12.00 / 0.61   | 3.3x / 13.0x   |
-| 32 | 2048 | 256 | 16 | 180.14 / 16.81  | 76.60 / 1.36   | 2.4x / 12.4x   |
-
-## Implementation
-
-### Farthest Point Sampling
-Standard greedy algorithm maintaining minimum distances to selected centroids. Each iteration selects the point farthest from all previously selected points.
-
-- **CPU**: Sequential selection with parallel batch processing. O(K·N·D) time, O(N) space.
-- **CUDA**: Cooperative parallel reduction within thread blocks. O(K·N·D) time, O(N) space per batch.
-
-### Fused FPS + k-Nearest Neighbors
-Combines FPS and kNN by reusing distance computations from the FPS phase.
-
-- **CPU**: Incremental heap tracking during FPS. Maintains top-k neighbors per centroid using max-heaps. O(K·N·log(k)) time, O(K·k) space.
-- **CUDA**: Stores all centroid distances during FPS, then applies PyTorch's optimized topk. O(K·N·D + K·N·log(k)) time, O(K·N) space per batch.
-
-Both implementations eliminate redundant distance calculations compared to separate FPS and kNN operations.
+| 4  | 100  | 16  | 8  | 0.42 / 1.22     | 0.07 / 0.35    | 6.00x / 3.50x  |
+| 8  | 512  | 64  | 16 | 4.14 / 4.43     | 2.01 / 1.25    | 2.06x / 3.55x  |
+| 16 | 1024 | 128 | 16 | 38.37 / 8.02    | 11.69 / 2.34   | 3.28x / 3.43x  |
+| 32 | 2048 | 256 | 16 | 177.50 / 16.62  | 78.47 / 4.94   | 2.26x / 3.36x  |
