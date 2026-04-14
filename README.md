@@ -2,10 +2,24 @@
 
 Optimized standard farthest point sampling (FPS) for PyTorch written in C++.
 
+## Install
+
+`torch-fps` is currently published as a source distribution, so `pip` builds the
+extension locally during install.
+
 ```bash
-pip install torch-fps
+# First install a PyTorch build that matches your platform and CUDA version.
+# Example for CUDA 12.8:
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Then build torch-fps against that exact Torch install.
+pip install --no-build-isolation torch-fps
 ```
-**Note**: Ensure gcc > 9 and < 14. Install might take a while since its building from source (to be fixed in future). 
+
+**Note**: Ensure `gcc > 9` and `< 14`. Install can take a while because it is
+built from source. `--no-build-isolation` is recommended so `pip` uses your
+existing PyTorch install instead of creating a temporary build environment with
+a different Torch/CUDA combination.
 
 ## Usage
 
