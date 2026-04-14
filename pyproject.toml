@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-    "setuptools>=64",
+    "setuptools>=77",
     "wheel",
     "torch>=2.1",
 ]
@@ -8,10 +8,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-fps"
-version = "0.2"
+version = "0.3"
 description = "Native PyTorch farthest point sampling for point cloud workloads"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Felix Yu" },
 ]
@@ -35,7 +36,6 @@ classifiers = [
 [tool.setuptools]
 packages = ["torch_fps"]
 include-package-data = true
-license-files = ["LICENSE"]
 
 [tool.setuptools.package-data]
 torch_fps = ["*.cpp", "*.cu", "*.h"]

@@ -4,8 +4,16 @@ Correctness tests for FPS and FPS+kNN implementations.
 Validates optimized kernels against pure PyTorch baselines.
 """
 
+import sys
+from pathlib import Path
+
 import torch
 import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from torch_fps import farthest_point_sampling, farthest_point_sampling_with_knn
 from baselines import fps_baseline, fps_with_knn_baseline
 
@@ -129,10 +137,7 @@ class TestFPSWithKNN:
 
         assert torch.equal(centroid_idx_fused, centroid_idx_base), \
             f"Centroid indices mismatch on {device}"
-        # Sort neighbor indices before comparing (optimized version may return unsorted)
-        neighbor_idx_fused_sorted = torch.sort(neighbor_idx_fused, dim=-1)[0]
-        neighbor_idx_base_sorted = torch.sort(neighbor_idx_base, dim=-1)[0]
-        assert torch.equal(neighbor_idx_fused_sorted, neighbor_idx_base_sorted), \
+        assert torch.equal(neighbor_idx_fused, neighbor_idx_base), \
             f"Neighbor indices mismatch on {device}"
 
     @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -162,10 +167,7 @@ class TestFPSWithKNN:
         )
 
         assert torch.equal(centroid_idx_fused, centroid_idx_base)
-        # Sort neighbor indices before comparing (optimized version may return unsorted)
-        neighbor_idx_fused_sorted = torch.sort(neighbor_idx_fused, dim=-1)[0]
-        neighbor_idx_base_sorted = torch.sort(neighbor_idx_base, dim=-1)[0]
-        assert torch.equal(neighbor_idx_fused_sorted, neighbor_idx_base_sorted)
+        assert torch.equal(neighbor_idx_fused, neighbor_idx_base)
 
     @pytest.mark.parametrize("device", ["cpu", "cuda"])
     def test_fused_edge_cases(self, device):
@@ -186,10 +188,7 @@ class TestFPSWithKNN:
             points, mask, K, 1, start_idx
         )
         assert torch.equal(centroid_idx_fused, centroid_idx_base)
-        # Sort neighbor indices before comparing (optimized version may return unsorted)
-        neighbor_idx_fused_sorted = torch.sort(neighbor_idx_fused, dim=-1)[0]
-        neighbor_idx_base_sorted = torch.sort(neighbor_idx_base, dim=-1)[0]
-        assert torch.equal(neighbor_idx_fused_sorted, neighbor_idx_base_sorted)
+        assert torch.equal(neighbor_idx_fused, neighbor_idx_base)
         assert neighbor_idx_fused.shape == (B, K, 1)
 
         # k = N (maximum neighbors)
@@ -200,10 +199,7 @@ class TestFPSWithKNN:
             points, mask, K, N, start_idx
         )
         assert torch.equal(centroid_idx_fused, centroid_idx_base)
-        # Sort neighbor indices before comparing (optimized version may return unsorted)
-        neighbor_idx_fused_sorted = torch.sort(neighbor_idx_fused, dim=-1)[0]
-        neighbor_idx_base_sorted = torch.sort(neighbor_idx_base, dim=-1)[0]
-        assert torch.equal(neighbor_idx_fused_sorted, neighbor_idx_base_sorted)
+        assert torch.equal(neighbor_idx_fused, neighbor_idx_base)
         assert neighbor_idx_fused.shape == (B, K, N)
 
 
@@ -256,6 +252,201 @@ class TestDeterminism:
 
         assert torch.equal(cent1, cent2), "Centroids not deterministic"
         assert torch.equal(neigh1, neigh2), "Neighbors not deterministic"
+
+
+# ============================================================================
+# Regression tests for the fixes landed alongside these tests
+# ============================================================================
+
+class TestDuplicatePoints:
+    """Cover the 'FPS re-picks same index on duplicates' bug."""
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_duplicate_coords_unique_indices(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        points = torch.tensor(
+            [[[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]],
+            device=device,
+        )
+        mask = torch.ones(1, 4, dtype=torch.bool, device=device)
+        start = torch.zeros(1, dtype=torch.long, device=device)
+        idx = farthest_point_sampling(points, mask, K=4, start_idx=start, random_start=False)
+        base = fps_baseline(points, mask, 4, start)
+        assert torch.equal(idx, base)
+        assert len(set(idx[0].tolist())) == 4
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_k_exceeds_unique_coords(self, device):
+        """10 points at 4 unique positions, K=8 — must still return 8 distinct indices."""
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(0)
+        unique = torch.randn(4, 3)
+        points = unique[[0, 1, 2, 3, 0, 1, 2, 3, 0, 1]].unsqueeze(0).to(device)
+        mask = torch.ones(1, 10, dtype=torch.bool, device=device)
+        start = torch.zeros(1, dtype=torch.long, device=device)
+        idx = farthest_point_sampling(points, mask, K=8, start_idx=start, random_start=False)
+        base = fps_baseline(points, mask, 8, start)
+        assert torch.equal(idx, base)
+        assert len(set(idx[0].tolist())) == 8
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_all_zeros_with_mask(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        points = torch.zeros(1, 5, 3, device=device)
+        mask = torch.tensor([[True, False, True, True, True]], device=device)
+        start = torch.zeros(1, dtype=torch.long, device=device)
+        idx = farthest_point_sampling(points, mask, K=4, start_idx=start, random_start=False)
+        base = fps_baseline(points, mask, 4, start)
+        assert torch.equal(idx, base)
+        # every output index must be a valid (unmasked) point
+        assert all(mask[0, i].item() for i in idx[0].tolist())
+
+
+class TestRandomStartDistribution:
+    """Cover the 'random_start collapses to first_valid' bug."""
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_scattered_mask_uniform(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        points = torch.randn(1, 8, 3, device=device)
+        mask = torch.tensor(
+            [[False, False, True, False, True, False, True, False]],
+            device=device,
+        )
+        counts = {2: 0, 4: 0, 6: 0}
+        trials = 1500
+        for seed in range(trials):
+            gen = torch.Generator(device=device).manual_seed(seed)
+            idx = farthest_point_sampling(points, mask, K=1, generator=gen)
+            pick = idx[0, 0].item()
+            assert pick in counts, f"random start picked invalid index {pick}"
+            counts[pick] += 1
+        expected = trials / 3
+        # chi-square-ish tolerance: each bin within 20% of expected
+        for k, v in counts.items():
+            assert abs(v - expected) < 0.2 * expected, \
+                f"bin {k} has {v}, expected ~{expected:.0f}"
+
+
+class TestLowPrecisionParity:
+    """Cover the acc_t = scalar_t accumulator bug."""
+
+    @pytest.mark.parametrize("low_dtype", [torch.float16, torch.bfloat16])
+    def test_fp16_bf16_cuda_parity(self, low_dtype):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(0)
+        B, N, D, K = 1, 500, 64, 32
+        pts32 = (torch.randn(B, N, D) * 20).cuda()
+        mask = torch.ones(B, N, dtype=torch.bool, device='cuda')
+        start = torch.zeros(B, dtype=torch.long, device='cuda')
+
+        ref = farthest_point_sampling(
+            pts32, mask, K, start_idx=start, random_start=False, precision=torch.float32
+        )
+        low = farthest_point_sampling(
+            pts32.to(low_dtype), mask, K,
+            start_idx=start, random_start=False, precision=low_dtype,
+        )
+
+        ref_set = set(ref[0].tolist())
+        low_set = set(low[0].tolist())
+        jaccard = len(ref_set & low_set) / len(ref_set | low_set)
+        # Pre-fix: ~3% agreement on this workload. Post-fix: should be >= 90%.
+        assert jaccard >= 0.9, f"{low_dtype} parity too low: jaccard={jaccard:.3f}"
+
+
+class TestKNNEdgeCases:
+    """Cover kNN overflow (k_neighbors > valid_count) and the sorted contract."""
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_k_neighbors_exceeds_valid_count(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(0)
+        B, N, D = 1, 10, 3
+        points = torch.randn(B, N, D, device=device)
+        # index 0 invalid; 5 valid at [1..5]
+        mask = torch.tensor(
+            [[False, True, True, True, True, True, False, False, False, False]],
+            device=device,
+        )
+        start = torch.tensor([1], dtype=torch.long, device=device)
+        cent, nbr = farthest_point_sampling_with_knn(
+            points, mask, K=3, k_neighbors=8,
+            start_idx=start, random_start=False,
+        )
+        # every returned neighbor must be a valid (unmasked) point
+        flat = nbr.flatten().tolist()
+        for i in flat:
+            assert mask[0, i].item(), f"neighbor index {i} is masked-out"
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_neighbors_sorted_by_distance(self, device):
+        """Must return neighbors in closest-first order (docstring contract)."""
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        points = torch.tensor(
+            [[[0.0, 0.0], [2.0, 0.0], [1.0, 0.0], [3.0, 0.0]]],
+            device=device,
+        )
+        mask = torch.ones(1, 4, dtype=torch.bool, device=device)
+        start = torch.zeros(1, dtype=torch.long, device=device)
+        cent, nbr = farthest_point_sampling_with_knn(
+            points, mask, K=1, k_neighbors=4,
+            start_idx=start, random_start=False,
+        )
+        # centroid is index 0 at (0,0); sorted distances are [0, 1, 4, 9] → [0, 2, 1, 3]
+        assert nbr[0, 0].tolist() == [0, 2, 1, 3], \
+            f"got {nbr[0, 0].tolist()}, expected closest-first [0, 2, 1, 3]"
+
+        # Generalized: distances along the neighbor axis should be non-decreasing.
+        cent_coords = points[0, cent[0, 0]]
+        nbr_coords = points[0, nbr[0, 0]]
+        dists = ((nbr_coords - cent_coords) ** 2).sum(dim=-1)
+        assert torch.all(dists[1:] >= dists[:-1]), f"neighbors not sorted: {dists}"
+
+
+class TestNaNHandling:
+    """NaN-coordinate points must be treated as invalid and never selected."""
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_nan_point_never_selected(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(0)
+        points = torch.randn(1, 10, 3, device=device)
+        points[0, 5] = float('nan')
+        mask = torch.ones(1, 10, dtype=torch.bool, device=device)
+        start = torch.zeros(1, dtype=torch.long, device=device)
+        idx = farthest_point_sampling(points, mask, K=6, start_idx=start, random_start=False)
+        assert 5 not in idx[0].tolist(), f"NaN index selected: {idx[0].tolist()}"
+        assert len(set(idx[0].tolist())) == 6
+
+
+class TestImportErrorChain:
+    """Cover ImportError-swallowing bug — chain must preserve the original cause."""
+
+    def test_cause_is_chained(self):
+        import torch_fps.fps as fps_mod
+        saved_c = fps_mod._C
+        saved_err = fps_mod._import_error
+        fps_mod._C = None
+        fps_mod._import_error = ImportError("undefined symbol: _Z_fake_test")
+        try:
+            with pytest.raises(RuntimeError) as info:
+                farthest_point_sampling(
+                    torch.randn(1, 5, 3), torch.ones(1, 5, dtype=torch.bool), K=2
+                )
+            assert isinstance(info.value.__cause__, ImportError)
+            assert "undefined symbol" in str(info.value.__cause__)
+        finally:
+            fps_mod._C = saved_c
+            fps_mod._import_error = saved_err
 
 
 if __name__ == "__main__":

@@ -32,8 +32,20 @@ def get_extensions():
         "cxx": ["-O3", "-std=c++17"],
     }
 
+    # Enable OpenMP for at::parallel_for. Without it, parallel_for silently
+    # falls back to a serial implementation on OpenMP-backed PyTorch builds.
     if sys.platform == "win32":
-        extra_compile_args["cxx"].append("/EHsc")
+        extra_compile_args["cxx"].extend(["/EHsc", "/openmp"])
+    elif sys.platform == "darwin":
+        # libomp is optional on macOS; let the user opt in via env var.
+        if os.environ.get("TORCH_FPS_ENABLE_OPENMP", "1") != "0":
+            extra_compile_args["cxx"].append("-Xpreprocessor")
+            extra_compile_args["cxx"].append("-fopenmp")
+    else:
+        extra_compile_args["cxx"].append("-fopenmp")
+
+    if sys.platform == "win32":
+        pass  # handled above
     elif sys.platform == "darwin":
         extra_compile_args["cxx"].append("-stdlib=libc++")
         if "MACOSX_DEPLOYMENT_TARGET" not in os.environ:
@@ -50,6 +62,17 @@ def get_extensions():
                     extra_compile_args["cxx"].append(f"-I{sdk_cxx}")
         except (subprocess.CalledProcessError, FileNotFoundError):
             pass
+
+    # Linker flags: OpenMP runtime needs to be linked for the inline
+    # pragmas in ATen's parallel headers to resolve to real parallel code.
+    extra_link_args: list[str] = []
+    if sys.platform == "win32":
+        pass  # /openmp handles both compile and link
+    elif sys.platform == "darwin":
+        if os.environ.get("TORCH_FPS_ENABLE_OPENMP", "1") != "0":
+            extra_link_args.append("-lomp")
+    else:
+        extra_link_args.append("-fopenmp")
 
     extensions = []
 
@@ -87,6 +110,7 @@ def get_extensions():
                 sources=cuda_sources,
                 include_dirs=include_dirs,
                 extra_compile_args=extra_compile_args,
+                extra_link_args=extra_link_args,
             )
         )
     else:
@@ -96,6 +120,7 @@ def get_extensions():
                 sources=sources,
                 include_dirs=include_dirs,
                 extra_compile_args=extra_compile_args,
+                extra_link_args=extra_link_args,
             )
         )
 

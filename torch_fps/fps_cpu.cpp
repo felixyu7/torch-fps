@@ -12,6 +12,134 @@
 namespace torch_fps {
 namespace {
 
+// Within-batch parallel FPS kernel: parallelizes the per-iteration distance
+// update and argmax across threads. Used when B is smaller than the thread
+// pool so that a single batch can still saturate the CPU.
+template <typename scalar_t, typename acc_t>
+void fps_kernel_cpu_inner_parallel(
+    const scalar_t* points,
+    const bool* mask,
+    int64_t N,
+    int64_t D,
+    int64_t K,
+    int64_t start,
+    int64_t* out_indices) {
+    std::vector<acc_t> min_dists(static_cast<size_t>(N));
+
+    const acc_t inf = std::numeric_limits<acc_t>::infinity();
+    const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
+    const int num_threads = std::max(1, at::get_num_threads());
+    const int64_t grain = std::max<int64_t>(512, (N + num_threads - 1) / num_threads);
+
+    // Init pass (serial — single linear scan, cheap enough).
+    int64_t valid_count = 0;
+    for (int64_t n = 0; n < N; ++n) {
+        bool is_valid = mask[n];
+        if (is_valid) {
+            const scalar_t* point = points + n * D;
+            for (int64_t d = 0; d < D; ++d) {
+                if (std::isnan(static_cast<float>(point[d]))) {
+                    is_valid = false;
+                    break;
+                }
+            }
+        }
+        if (is_valid) {
+            min_dists[n] = inf;
+            ++valid_count;
+        } else {
+            min_dists[n] = neg_inf;
+        }
+    }
+
+    const int64_t effective_k = std::min<int64_t>(valid_count, K);
+    int64_t last = (start >= 0 && start < N) ? start : 0;
+
+    if (K == 0) {
+        return;
+    }
+    if (effective_k == 0) {
+        std::fill(out_indices, out_indices + K, last);
+        return;
+    }
+
+    // Thread-local argmax slots, reused across iterations. Aligned to cache
+    // lines to avoid false sharing when multiple threads update neighbors.
+    struct alignas(64) Local { acc_t val; int64_t idx; char pad[48]; };
+    std::vector<Local> locals(static_cast<size_t>(num_threads));
+
+    for (int64_t i = 0; i < effective_k; ++i) {
+        const scalar_t* centroid = points + last * D;
+        out_indices[i] = last;
+        // Mark selected before the scan so it is excluded from both the
+        // distance update (already at neg_inf, skipped) and the argmax.
+        min_dists[last] = neg_inf;
+
+        if (i + 1 >= effective_k) {
+            break;  // no argmax needed on the final iteration
+        }
+
+        // Seed thread-local argmax slots with sentinel (idx=-1) so inactive
+        // threads are naturally ignored in the final merge.
+        for (int t = 0; t < num_threads; ++t) {
+            locals[t].val = neg_inf;
+            locals[t].idx = -1;
+        }
+
+        // Fused parallel_for: each thread updates min_dists for its range
+        // AND tracks a local argmax in the same pass. Halves the
+        // at::parallel_for launch overhead vs. two separate calls.
+        at::parallel_for(0, N, grain, [&](int64_t begin, int64_t end) {
+            const int t = at::get_thread_num();
+            acc_t best_v = locals[t].val;
+            int64_t best_i = locals[t].idx;
+            for (int64_t n = begin; n < end; ++n) {
+                acc_t md = min_dists[n];
+                if (md == neg_inf) {
+                    continue;
+                }
+                const scalar_t* point = points + n * D;
+                acc_t dist = acc_t(0);
+                for (int64_t d = 0; d < D; ++d) {
+                    const acc_t diff =
+                        static_cast<acc_t>(point[d]) - static_cast<acc_t>(centroid[d]);
+                    dist += diff * diff;
+                }
+                if (dist < md) {
+                    md = dist;
+                    min_dists[n] = dist;
+                }
+                if (best_i < 0 || md > best_v ||
+                    (md == best_v && n < best_i)) {
+                    best_v = md;
+                    best_i = n;
+                }
+            }
+            locals[t].val = best_v;
+            locals[t].idx = best_i;
+        });
+
+        acc_t best_v = neg_inf;
+        int64_t best_i = last;
+        bool have_any = false;
+        for (int t = 0; t < num_threads; ++t) {
+            if (locals[t].idx < 0) continue;
+            if (!have_any ||
+                locals[t].val > best_v ||
+                (locals[t].val == best_v && locals[t].idx < best_i)) {
+                best_v = locals[t].val;
+                best_i = locals[t].idx;
+                have_any = true;
+            }
+        }
+        last = best_i;
+    }
+
+    for (int64_t i = effective_k; i < K; ++i) {
+        out_indices[i] = out_indices[effective_k - 1];
+    }
+}
+
 template <typename scalar_t, typename acc_t>
 void fps_kernel_cpu(
     const scalar_t* points,
@@ -28,11 +156,21 @@ void fps_kernel_cpu(
     const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
 
     for (int64_t n = 0; n < N; ++n) {
-        if (mask[n]) {
+        bool is_valid = mask[n];
+        if (is_valid) {
+            const scalar_t* point = points + n * D;
+            for (int64_t d = 0; d < D; ++d) {
+                if (std::isnan(static_cast<float>(point[d]))) {
+                    is_valid = false;
+                    break;
+                }
+            }
+        }
+        if (is_valid) {
             min_dists[n] = inf;
             ++valid_count;
         } else {
-            min_dists[n] = acc_t(0);
+            min_dists[n] = neg_inf;
         }
     }
 
@@ -48,15 +186,15 @@ void fps_kernel_cpu(
         return;
     }
 
-    for (int64_t i = 0; i < K; ++i) {
+    for (int64_t i = 0; i < effective_k; ++i) {
         // Update min_dists based on distance to current centroid
         // This matches: d = (points - c[:, None, :]).square().sum(dim=2)
         //               min_dists = torch.minimum(min_dists, d)
         const scalar_t* centroid = points + last * D;
 
         for (int64_t n = 0; n < N; ++n) {
-            if (!mask[n]) {
-                continue;  // Skip distance computation for invalid points
+            if (min_dists[n] == neg_inf) {
+                continue;  // invalid, NaN, or already-selected
             }
 
             const scalar_t* point = points + n * D;
@@ -67,31 +205,33 @@ void fps_kernel_cpu(
                 dist += diff * diff;
             }
 
-            // Update minimum distance
             if (dist < min_dists[n]) {
                 min_dists[n] = dist;
             }
         }
 
-        // Record selection (matches: idx[:, i] = last)
         out_indices[i] = last;
+        min_dists[last] = neg_inf;  // prevent re-selection
 
-        // Find next farthest point (matches: last = torch.argmax(min_dists, dim=1))
-        if (i + 1 < K) {
+        if (i + 1 < effective_k) {
             acc_t best_val = neg_inf;
-            int64_t best_idx = 0;
-
+            int64_t best_idx = last;
             for (int64_t n = 0; n < N; ++n) {
-                // argmax over all points (invalids have 0.0, selected have 0.0 after update)
                 if (min_dists[n] > best_val ||
                     (min_dists[n] == best_val && n < best_idx)) {
                     best_val = min_dists[n];
                     best_idx = n;
                 }
             }
-
             last = best_idx;
         }
+    }
+
+    // Pad remaining slots with the last valid selection (reached only when
+    // the user's K exceeds the number of non-NaN valid points, which the
+    // wrapper's K <= counts check cannot see).
+    for (int64_t i = effective_k; i < K; ++i) {
+        out_indices[i] = out_indices[effective_k - 1];
     }
 }
 
@@ -112,25 +252,40 @@ void fps_with_knn_kernel_cpu(
     int64_t* out_neighbor_indices) {  // [K, k_neighbors]
 
     std::vector<acc_t> min_dists(static_cast<size_t>(N));
-    // Incremental kNN tracking: one buffer per centroid
-    std::vector<std::vector<std::pair<acc_t, int64_t>>> knn_buffers(static_cast<size_t>(K));
+    // Flat contiguous kNN buffer: K rows of up to k_neighbors (dist, idx)
+    // pairs. `knn_sizes[i]` holds the current fill for row i. A single
+    // allocation replaces the old vector-of-vectors.
+    using KnnPair = std::pair<acc_t, int64_t>;
+    std::vector<KnnPair> knn_buffer(
+        static_cast<size_t>(K) * static_cast<size_t>(k_neighbors));
+    std::vector<int64_t> knn_sizes(static_cast<size_t>(K), 0);
+    // Tracks which points are geometrically valid (masked AND non-NaN).
+    // Separate from min_dists because the kNN loop needs to include
+    // already-selected centroids, whereas the FPS argmax must not.
+    std::vector<char> point_valid(static_cast<size_t>(N), 0);
 
     int64_t valid_count = 0;
     const acc_t inf = std::numeric_limits<acc_t>::infinity();
     const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
 
     for (int64_t n = 0; n < N; ++n) {
-        if (mask[n]) {
+        bool is_valid = mask[n];
+        if (is_valid) {
+            const scalar_t* point = points + n * D;
+            for (int64_t d = 0; d < D; ++d) {
+                if (std::isnan(static_cast<float>(point[d]))) {
+                    is_valid = false;
+                    break;
+                }
+            }
+        }
+        point_valid[n] = is_valid ? 1 : 0;
+        if (is_valid) {
             min_dists[n] = inf;
             ++valid_count;
         } else {
-            min_dists[n] = acc_t(0);
+            min_dists[n] = neg_inf;
         }
-    }
-
-    // Pre-allocate kNN buffers
-    for (int64_t i = 0; i < K; ++i) {
-        knn_buffers[i].reserve(static_cast<size_t>(k_neighbors));
     }
 
     const int64_t effective_k = std::min<int64_t>(valid_count, K);
@@ -142,19 +297,19 @@ void fps_with_knn_kernel_cpu(
 
     if (effective_k == 0) {
         std::fill(out_centroid_indices, out_centroid_indices + K, last);
-        // Fill neighbor indices with 0 (or any valid index)
         std::fill(out_neighbor_indices, out_neighbor_indices + K * k_neighbors, 0);
         return;
     }
 
-    // FPS loop with incremental kNN tracking
-    for (int64_t i = 0; i < K; ++i) {
+    // FPS loop with incremental kNN tracking (flat buffer, K*k_neighbors).
+    for (int64_t i = 0; i < effective_k; ++i) {
         const scalar_t* centroid = points + last * D;
-        auto& knn_buffer = knn_buffers[i];
+        KnnPair* row = knn_buffer.data() + i * k_neighbors;
+        int64_t& row_size = knn_sizes[i];
 
         for (int64_t n = 0; n < N; ++n) {
-            if (!mask[n]) {
-                continue;  // Skip invalid points entirely
+            if (!point_valid[n]) {
+                continue;
             }
 
             const scalar_t* point = points + n * D;
@@ -165,34 +320,29 @@ void fps_with_knn_kernel_cpu(
                 dist += diff * diff;
             }
 
-            // Incremental kNN tracking using max-heap
-            // Heap property: largest distance at front
-            if (knn_buffer.size() < static_cast<size_t>(k_neighbors)) {
-                knn_buffer.push_back({dist, n});
-                if (knn_buffer.size() == static_cast<size_t>(k_neighbors)) {
-                    std::make_heap(knn_buffer.begin(), knn_buffer.end());
+            // Max-heap on the flat row: largest dist at the front.
+            if (row_size < k_neighbors) {
+                row[row_size++] = {dist, n};
+                if (row_size == k_neighbors) {
+                    std::make_heap(row, row + k_neighbors);
                 }
-            } else if (dist < knn_buffer.front().first) {
-                // Replace the farthest neighbor with this closer one
-                std::pop_heap(knn_buffer.begin(), knn_buffer.end());
-                knn_buffer.back() = {dist, n};
-                std::push_heap(knn_buffer.begin(), knn_buffer.end());
+            } else if (dist < row[0].first) {
+                std::pop_heap(row, row + k_neighbors);
+                row[k_neighbors - 1] = {dist, n};
+                std::push_heap(row, row + k_neighbors);
             }
 
-            // Update minimum distance for FPS
-            if (dist < min_dists[n]) {
+            if (min_dists[n] != neg_inf && dist < min_dists[n]) {
                 min_dists[n] = dist;
             }
         }
 
-        // Record selection
         out_centroid_indices[i] = last;
+        min_dists[last] = neg_inf;  // prevent re-selection
 
-        // Find next farthest point
-        if (i + 1 < K) {
+        if (i + 1 < effective_k) {
             acc_t best_val = neg_inf;
-            int64_t best_idx = 0;
-
+            int64_t best_idx = last;
             for (int64_t n = 0; n < N; ++n) {
                 if (min_dists[n] > best_val ||
                     (min_dists[n] == best_val && n < best_idx)) {
@@ -200,27 +350,33 @@ void fps_with_knn_kernel_cpu(
                     best_idx = n;
                 }
             }
-
             last = best_idx;
         }
     }
 
-    // Extract neighbor indices from kNN buffers
-    for (int64_t i = 0; i < K; ++i) {
-        const auto& knn_buffer = knn_buffers[i];
-        const int64_t k_actual = std::min<int64_t>(
-            k_neighbors,
-            static_cast<int64_t>(knn_buffer.size())
-        );
+    // Pad remaining centroid slots (reached only when effective_k < K).
+    for (int64_t i = effective_k; i < K; ++i) {
+        out_centroid_indices[i] = out_centroid_indices[effective_k - 1];
+    }
 
-        // Copy neighbor indices (unsorted order is acceptable)
+    // Extract neighbor indices, sorted closest-first to match the docstring.
+    for (int64_t i = 0; i < effective_k; ++i) {
+        KnnPair* row = knn_buffer.data() + i * k_neighbors;
+        const int64_t k_actual = knn_sizes[i];
+
+        // std::sort gives ascending (closest-first) regardless of heap state.
+        std::sort(row, row + k_actual);
+
         for (int64_t k = 0; k < k_actual; ++k) {
-            out_neighbor_indices[i * k_neighbors + k] = knn_buffer[k].second;
+            out_neighbor_indices[i * k_neighbors + k] = row[k].second;
         }
-
-        // Fill remaining slots if we have fewer than k_neighbors valid points
-        // Use the centroid itself as fallback
         for (int64_t k = k_actual; k < k_neighbors; ++k) {
+            out_neighbor_indices[i * k_neighbors + k] = out_centroid_indices[i];
+        }
+    }
+    // Pad kNN rows for any padded centroid slots.
+    for (int64_t i = effective_k; i < K; ++i) {
+        for (int64_t k = 0; k < k_neighbors; ++k) {
             out_neighbor_indices[i * k_neighbors + k] = out_centroid_indices[i];
         }
     }
@@ -262,31 +418,44 @@ at::Tensor fps_forward_cpu(
                                       .dtype(at::kLong)
                                       .device(points_contig.device()));
 
+    // Inner parallelism only beats outer when the batch dimension itself
+    // can't saturate the thread pool (B == 1) and each iteration's work is
+    // big enough to amortize the at::parallel_for launch cost.
+    const int num_threads = std::max(1, at::get_num_threads());
+    const bool use_inner_parallel =
+        (num_threads > 1) &&
+        (B == 1) &&
+        (N * D >= 8192);
+
     AT_DISPATCH_FLOATING_TYPES_AND(at::kHalf, points_contig.scalar_type(), "fps_forward_cpu", [&] {
-        using acc_t = scalar_t;  // Keep original precision (fp16, fp32, or fp64)
+        using acc_t = at::acc_type<scalar_t, /*is_cuda=*/true>;
 
         const scalar_t* points_ptr = points_contig.data_ptr<scalar_t>();
         const bool* mask_ptr = mask_contig.data_ptr<bool>();
         const int64_t* start_ptr = start_contig.data_ptr<int64_t>();
         int64_t* idx_ptr = idx.data_ptr<int64_t>();
 
-        at::parallel_for(0, B, 0, [&](int64_t begin, int64_t end) {
-            for (int64_t b = begin; b < end; ++b) {
+        if (use_inner_parallel) {
+            for (int64_t b = 0; b < B; ++b) {
                 const scalar_t* batch_points = points_ptr + b * N * D;
                 const bool* batch_mask = mask_ptr + b * N;
                 const int64_t start = start_ptr[b];
                 int64_t* batch_idx = idx_ptr + b * K;
-
-                fps_kernel_cpu<scalar_t, acc_t>(
-                    batch_points,
-                    batch_mask,
-                    N,
-                    D,
-                    K,
-                    start,
-                    batch_idx);
+                fps_kernel_cpu_inner_parallel<scalar_t, acc_t>(
+                    batch_points, batch_mask, N, D, K, start, batch_idx);
             }
-        });
+        } else {
+            at::parallel_for(0, B, 0, [&](int64_t begin, int64_t end) {
+                for (int64_t b = begin; b < end; ++b) {
+                    const scalar_t* batch_points = points_ptr + b * N * D;
+                    const bool* batch_mask = mask_ptr + b * N;
+                    const int64_t start = start_ptr[b];
+                    int64_t* batch_idx = idx_ptr + b * K;
+                    fps_kernel_cpu<scalar_t, acc_t>(
+                        batch_points, batch_mask, N, D, K, start, batch_idx);
+                }
+            });
+        }
     });
 
     return idx;
@@ -336,7 +505,7 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cpu(
                                                            .device(points_contig.device()));
 
     AT_DISPATCH_FLOATING_TYPES_AND(at::kHalf, points_contig.scalar_type(), "fps_with_knn_forward_cpu", [&] {
-        using acc_t = scalar_t;  // Keep original precision (fp16, fp32, or fp64)
+        using acc_t = at::acc_type<scalar_t, /*is_cuda=*/true>;
 
         const scalar_t* points_ptr = points_contig.data_ptr<scalar_t>();
         const bool* mask_ptr = mask_contig.data_ptr<bool>();

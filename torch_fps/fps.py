@@ -5,10 +5,89 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+_C = None
+_import_error: Optional[BaseException] = None
 try:
     from . import _C  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover - extension absent in pure-Python env
-    _C = None
+except ImportError as _exc:  # pragma: no cover - extension absent or ABI mismatch
+    _import_error = _exc
+
+
+def _require_extension() -> None:
+    if _C is None:
+        raise RuntimeError(
+            "torch-fps extension not available. "
+            "Rebuild with: python setup.py build_ext --inplace"
+        ) from _import_error
+
+
+def _resolve_start_idx(
+    mask_c: Tensor,
+    counts: Tensor,
+    B: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    start_idx: Optional[Tensor],
+    random_start: bool,
+    generator: Optional[torch.Generator],
+) -> Tensor:
+    """Produce a validated contiguous [B] long start_idx with minimal GPU syncs.
+
+    On the random-start path the result is sampled via torch.multinomial from
+    the valid mask, so every index is valid by construction and no further
+    validation sync is required. On the user-supplied path we fuse the
+    K<=counts, range, and mask-validity checks into a single `.any()` sync.
+    """
+    if start_idx is None:
+        # Fast path: multinomial is unbiased and guarantees valid indices.
+        problems = counts < K
+        if bool(problems.any()):
+            raise ValueError(
+                f"FPS requires K <= number of valid points. "
+                f"Found batch(es) with K={K} but fewer valid points."
+            )
+        if not random_start:
+            return torch.zeros(B, device=device, dtype=torch.long).contiguous()
+        # multinomial needs fp32/fp64 probabilities regardless of the kernel precision.
+        probs = mask_c.to(torch.float32)
+        if generator is not None:
+            drawn = torch.multinomial(probs, 1, generator=generator)
+        else:
+            drawn = torch.multinomial(probs, 1)
+        return drawn.squeeze(-1).to(torch.long).contiguous()
+
+    # User-supplied path. Fuse all validation into a single sync. Bad
+    # inputs (K>counts, out-of-range) raise; a start_idx that points to a
+    # masked-out slot is silently repaired to the first valid index in that
+    # row, matching the Python baseline's behavior.
+    start_idx = start_idx.to(device=device, dtype=torch.long)
+    if start_idx.numel() != B:
+        raise ValueError("start_idx must have shape [B]")
+    start_idx = start_idx.reshape(B)
+
+    out_of_range = (start_idx < 0) | (start_idx >= N)
+    insufficient = counts < K
+    problems = out_of_range | insufficient
+    if bool(problems.any()):
+        if bool(insufficient.any()):
+            raise ValueError(
+                f"FPS requires K <= number of valid points. "
+                f"Found batch(es) with K={K} but fewer valid points."
+            )
+        raise ValueError("start_idx values must be within [0, N)")
+
+    # Repair any start index that points to a masked-out slot. Avoid the
+    # extra sync on the common "already valid" path by skipping the repair
+    # when counts>0 implies at least one valid index exists. The repair is
+    # pure-tensor: no sync.
+    has_valid = counts > 0
+    safe_start = start_idx.clamp(0, max(N - 1, 0))
+    supplied_valid = mask_c.gather(1, safe_start.unsqueeze(-1)).squeeze(-1)
+    first_valid = torch.argmax(mask_c.long(), dim=1)
+    repaired = torch.where(supplied_valid | ~has_valid, start_idx, first_valid)
+    return repaired.contiguous()
 
 
 def farthest_point_sampling(
@@ -88,65 +167,13 @@ def farthest_point_sampling(
 
     counts = mask_c.sum(dim=1, dtype=torch.long)
 
-    # FPS is a downsampling algorithm - require K <= counts
-    if K > 0:
-        insufficient = counts < K
-        if bool(insufficient.any()):
-            raise ValueError(
-                f"FPS requires K <= number of valid points. "
-                f"Found batch(es) with K={K} but fewer valid points."
-            )
+    start_idx = _resolve_start_idx(
+        mask_c, counts, B, N, K, dtype, device,
+        start_idx, random_start, generator,
+    )
 
-    if start_idx is not None:
-        start_idx = start_idx.to(device=device, dtype=torch.long)
-        if start_idx.numel() != B:
-            raise ValueError("start_idx must have shape [B]")
-    else:
-        if random_start:
-            # Random initial point per batch (matches vectorized floor(rand * counts) approach)
-            # Note: assumes valid points are densely packed at indices [0, ..., counts-1]
-            if generator is not None:
-                rand = torch.rand(B, device=device, dtype=dtype, generator=generator)
-            else:
-                rand = torch.rand(B, device=device, dtype=dtype)
-            start_idx = torch.floor(rand * counts.to(dtype).clamp(min=1)).to(torch.long)
-            start_idx = start_idx.masked_fill(counts == 0, 0)
-        else:
-            start_idx = torch.zeros(B, device=device, dtype=torch.long)
-
-    start_idx = start_idx.masked_fill(counts == 0, 0)
-    invalid_range = (start_idx < 0) | (start_idx >= N)
-    if bool(invalid_range.any()):
-        raise ValueError("start_idx values must be within [0, N)")
-
-    has_valid_points = counts > 0
-    if bool(has_valid_points.any()):
-        current_valid = mask_c[has_valid_points, start_idx[has_valid_points]]
-        if bool((~current_valid).any()):
-            first_valid = torch.argmax(mask_c.long(), dim=1)
-            replacement = first_valid[has_valid_points]
-            start_idx = start_idx.clone()
-            start_idx[has_valid_points] = torch.where(
-                current_valid,
-                start_idx[has_valid_points],
-                replacement,
-            )
-
-    if bool(has_valid_points.any()):
-        invalid_mask = ~mask_c[has_valid_points, start_idx[has_valid_points]]
-        if bool(invalid_mask.any()):
-            raise ValueError("start_idx must point to a valid point for batches with valid entries")
-
-    start_idx = start_idx.contiguous()
-
-    if _C is None:
-        raise RuntimeError(
-            "torch-fps extension not built. "
-            "Please build the extension with: python setup.py build_ext --inplace"
-        )
-
-    idx = _C.fps_forward(points_c, mask_c, start_idx, K)
-    return idx
+    _require_extension()
+    return _C.fps_forward(points_c, mask_c, start_idx, K)
 
 
 def farthest_point_sampling_with_knn(
@@ -253,62 +280,10 @@ def farthest_point_sampling_with_knn(
 
     counts = mask_c.sum(dim=1, dtype=torch.long)
 
-    # FPS is a downsampling algorithm - require K <= counts
-    if K > 0:
-        insufficient = counts < K
-        if bool(insufficient.any()):
-            raise ValueError(
-                f"FPS requires K <= number of valid points. "
-                f"Found batch(es) with K={K} but fewer valid points."
-            )
-
-    if start_idx is not None:
-        start_idx = start_idx.to(device=device, dtype=torch.long)
-        if start_idx.numel() != B:
-            raise ValueError("start_idx must have shape [B]")
-    else:
-        if random_start:
-            if generator is not None:
-                rand = torch.rand(B, device=device, dtype=dtype, generator=generator)
-            else:
-                rand = torch.rand(B, device=device, dtype=dtype)
-            start_idx = torch.floor(rand * counts.to(dtype).clamp(min=1)).to(torch.long)
-            start_idx = start_idx.masked_fill(counts == 0, 0)
-        else:
-            start_idx = torch.zeros(B, device=device, dtype=torch.long)
-
-    start_idx = start_idx.masked_fill(counts == 0, 0)
-    invalid_range = (start_idx < 0) | (start_idx >= N)
-    if bool(invalid_range.any()):
-        raise ValueError("start_idx values must be within [0, N)")
-
-    has_valid_points = counts > 0
-    if bool(has_valid_points.any()):
-        current_valid = mask_c[has_valid_points, start_idx[has_valid_points]]
-        if bool((~current_valid).any()):
-            first_valid = torch.argmax(mask_c.long(), dim=1)
-            replacement = first_valid[has_valid_points]
-            start_idx = start_idx.clone()
-            start_idx[has_valid_points] = torch.where(
-                current_valid,
-                start_idx[has_valid_points],
-                replacement,
-            )
-
-    if bool(has_valid_points.any()):
-        invalid_mask = ~mask_c[has_valid_points, start_idx[has_valid_points]]
-        if bool(invalid_mask.any()):
-            raise ValueError("start_idx must point to a valid point for batches with valid entries")
-
-    start_idx = start_idx.contiguous()
-
-    if _C is None:
-        raise RuntimeError(
-            "torch-fps extension not built. "
-            "Please build the extension with: python setup.py build_ext --inplace"
-        )
-
-    centroid_idx, neighbor_idx = _C.fps_with_knn_forward(
-        points_c, mask_c, start_idx, K, k_neighbors
+    start_idx = _resolve_start_idx(
+        mask_c, counts, B, N, K, dtype, device,
+        start_idx, random_start, generator,
     )
-    return centroid_idx, neighbor_idx
+
+    _require_extension()
+    return _C.fps_with_knn_forward(points_c, mask_c, start_idx, K, k_neighbors)

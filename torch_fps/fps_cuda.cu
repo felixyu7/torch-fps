@@ -54,12 +54,21 @@ __global__ void fps_kernel_cuda(
 
     int64_t local_count = 0;
     for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
-        const bool valid = batch_mask[n];
+        bool valid = batch_mask[n];
+        if (valid) {
+            const scalar_t* point = batch_points + n * D;
+            for (int64_t d = 0; d < D; ++d) {
+                if (::isnan(static_cast<float>(point[d]))) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
         if (valid) {
             batch_min_dists[n] = inf;
             ++local_count;
         } else {
-            batch_min_dists[n] = acc_t(0);
+            batch_min_dists[n] = neg_inf;
         }
     }
 
@@ -90,7 +99,7 @@ __global__ void fps_kernel_cuda(
         return;
     }
 
-    for (int64_t i = 0; i < K; ++i) {
+    for (int64_t i = 0; i < effective_k; ++i) {
         // All threads read the current selection from shared memory
         last = shared_last;
 
@@ -101,11 +110,9 @@ __global__ void fps_kernel_cuda(
         __syncthreads();
 
         // Phase 1: Update min_dists based on distance to current centroid
-        // This matches: d = (points - c[:, None, :]).square().sum(dim=2)
-        //               min_dists = torch.minimum(min_dists, d)
         for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
-            if (!batch_mask[n]) {
-                continue;  // Skip distance computation for invalid points
+            if (batch_min_dists[n] == neg_inf) {
+                continue;  // invalid, NaN, or already-selected
             }
 
             const scalar_t* point = batch_points + n * D;
@@ -116,21 +123,21 @@ __global__ void fps_kernel_cuda(
                 dist += diff * diff;
             }
 
-            // Update minimum distance
             if (dist < batch_min_dists[n]) {
                 batch_min_dists[n] = dist;
             }
         }
         __syncthreads();
 
-        // Record selection (matches: idx[:, i] = last)
+        // Record selection and mark it to prevent re-selection
         if (threadIdx.x == 0) {
             batch_idx[i] = last;
+            batch_min_dists[last] = neg_inf;
         }
         __syncthreads();
 
-        // Find next farthest point (matches: last = torch.argmax(min_dists, dim=1))
-        if (i + 1 < K) {
+        // Find next farthest point
+        if (i + 1 < effective_k) {
             // Phase 2: Each thread finds local argmax over its subset
             acc_t best_val = neg_inf;
             int64_t best_idx = 0;
@@ -173,7 +180,34 @@ __global__ void fps_kernel_cuda(
             __syncthreads();
         }
     }
+
+    // Pad remaining slots with the last valid selection. Only reached when
+    // effective_k < K (e.g. NaN points that the wrapper's K<=counts check
+    // could not see).
+    if (effective_k < K && threadIdx.x == 0) {
+        const int64_t fill = batch_idx[effective_k - 1];
+        for (int64_t i = effective_k; i < K; ++i) {
+            batch_idx[i] = fill;
+        }
+    }
 }
+
+// ============================================================================
+// NOTE on fused kNN v2 (single-pass top-k, reverted):
+// An experimental v2 kernel using per-thread register-resident top-k with a
+// block-wide pairwise merge tree was implemented and measured here. Analysis:
+//  - The oblivious sort-network insertion runs MAX_K predicated ops per
+//    point even with early-exit on the worst-slot check, matching v1's
+//    k_neighbors argmin scans in raw work.
+//  - The merge tree writes O(log(BS) * MAX_K) shared-memory entries per
+//    centroid, adding overhead that scales with K.
+//  - Register / shared-memory pressure forces BLOCK_SIZE ≤ 128, halving
+//    occupancy vs. v1's BLOCK_SIZE=256.
+//  - Net effect: ~1.5× gain in a narrow middle range (B≈16, N≈1024, k≤16)
+//    and 1.3-2× regressions on huge-N and many-batch workloads. Rolled
+//    back. The real single-pass win requires warp-level shuffle merges or
+//    block radix sort, which is significantly more involved.
+// ============================================================================
 
 // ============================================================================
 // Fused FPS + kNN kernel (optimized: compute distances during FPS)
@@ -224,12 +258,21 @@ __global__ void fps_with_knn_kernel_cuda(
 
     int64_t local_count = 0;
     for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
-        const bool valid = batch_mask[n];
+        bool valid = batch_mask[n];
+        if (valid) {
+            const scalar_t* point = batch_points + n * D;
+            for (int64_t d = 0; d < D; ++d) {
+                if (::isnan(static_cast<float>(point[d]))) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
         if (valid) {
             batch_min_dists[n] = inf;
             ++local_count;
         } else {
-            batch_min_dists[n] = acc_t(0);
+            batch_min_dists[n] = neg_inf;
         }
     }
 
@@ -256,15 +299,18 @@ __global__ void fps_with_knn_kernel_cuda(
             for (int64_t i = 0; i < K; ++i) {
                 batch_idx[i] = last;
             }
+            for (int64_t i = 0; i < K * k_neighbors; ++i) {
+                batch_neighbors[i] = 0;
+            }
         }
         return;
     }
 
-    for (int64_t i = 0; i < K; ++i) {
+    for (int64_t i = 0; i < effective_k; ++i) {
         // All threads read the current selection from shared memory
         last = shared_last;
 
-        // Compute distances to current centroid
+        // Load centroid coordinates into shared memory for reuse
         for (int64_t d = threadIdx.x; d < D; d += BLOCK_SIZE) {
             centroid_vals[d] = static_cast<acc_t>(batch_points[last * D + d]);
         }
@@ -273,7 +319,6 @@ __global__ void fps_with_knn_kernel_cuda(
         for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
             acc_t dist;
             if (!batch_mask[n]) {
-                // Invalid points get inf distance (will be filtered in kNN)
                 dist = inf;
             } else {
                 const scalar_t* point = batch_points + n * D;
@@ -283,25 +328,34 @@ __global__ void fps_with_knn_kernel_cuda(
                         static_cast<acc_t>(point[d]) - centroid_vals[d];
                     dist += diff * diff;
                 }
+                // NaN-coord points produce dist=NaN; promote to inf so the
+                // argmin has well-defined ordering. Self-inequality detects NaN.
+                if (!(dist == dist)) {
+                    dist = inf;
+                }
             }
 
-            // Store distance for kNN selection
             batch_curr_dists[n] = dist;
 
-            // Update minimum distance for FPS (skip invalid points)
-            if (batch_mask[n] && dist < batch_min_dists[n]) {
+            // FPS update: only for points that are still candidates.
+            // `min_dists[n] == neg_inf` covers invalid, NaN, and already-selected.
+            if (batch_min_dists[n] > neg_inf && dist < batch_min_dists[n]) {
                 batch_min_dists[n] = dist;
             }
         }
         __syncthreads();
 
-        // Record selection (matches: idx[:, i] = last)
+        // Record selection and mark it to prevent re-selection
         if (threadIdx.x == 0) {
             batch_idx[i] = last;
+            batch_min_dists[last] = neg_inf;
         }
         __syncthreads();
 
-        // Streaming kNN selection for the current centroid
+        // Streaming kNN selection for the current centroid.
+        // Points with `curr_dist == inf` are truly invalid (masked/NaN);
+        // previously-selected centroids have a real distance and are
+        // included here, matching the documented kNN contract.
         for (int64_t nn = 0; nn < k_neighbors; ++nn) {
             acc_t best_val = inf;
             int64_t best_idx = 0;
@@ -335,15 +389,20 @@ __global__ void fps_with_knn_kernel_cuda(
             }
 
             if (threadIdx.x == 0) {
-                const int64_t chosen = shared_idx[0];
-                batch_neighbors[i * k_neighbors + nn] = chosen;
-                batch_curr_dists[chosen] = inf;
+                if (shared_vals[0] == inf) {
+                    // No valid neighbor remains — fall back to the centroid
+                    // so the output contains a valid index (matches CPU).
+                    batch_neighbors[i * k_neighbors + nn] = batch_idx[i];
+                } else {
+                    const int64_t chosen = shared_idx[0];
+                    batch_neighbors[i * k_neighbors + nn] = chosen;
+                    batch_curr_dists[chosen] = inf;
+                }
             }
             __syncthreads();
         }
 
-        // Find next farthest point (matches: last = torch.argmax(min_dists, dim=1))
-        if (i + 1 < K) {
+        if (i + 1 < effective_k) {
             // Phase 2: Each thread finds local argmax over its subset
             acc_t best_val = neg_inf;
             int64_t best_idx = 0;
@@ -383,6 +442,17 @@ __global__ void fps_with_knn_kernel_cuda(
                 shared_last = last;
             }
             __syncthreads();
+        }
+    }
+
+    // Pad remaining centroid+neighbor slots when effective_k < K.
+    if (effective_k < K && threadIdx.x == 0) {
+        const int64_t fill = batch_idx[effective_k - 1];
+        for (int64_t i = effective_k; i < K; ++i) {
+            batch_idx[i] = fill;
+            for (int64_t k = 0; k < k_neighbors; ++k) {
+                batch_neighbors[i * k_neighbors + k] = fill;
+            }
         }
     }
 }
@@ -429,9 +499,10 @@ at::Tensor fps_forward_cuda(
     const dim3 blocks(static_cast<unsigned int>(B));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, points_contig.scalar_type(), "fps_forward_cuda", [&] {
-        using acc_t = scalar_t;  // Keep original precision (bf16, fp16, fp32, or fp64)
+        using acc_t = at::acc_type<scalar_t, /*is_cuda=*/true>;
+        const auto acc_dtype = c10::CppTypeToScalarType<acc_t>::value;
         auto min_dists =
-            at::empty({B, N}, points_contig.options());
+            at::empty({B, N}, points_contig.options().dtype(acc_dtype));
         const size_t shared_mem_bytes =
             static_cast<size_t>(D) * sizeof(acc_t);
         fps_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE>
@@ -502,23 +573,21 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
                                       .device(points_contig.device()));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, points_contig.scalar_type(), "fps_with_knn_forward_cuda", [&] {
-        using acc_t = scalar_t;  // Keep original precision (bf16, fp16, fp32, or fp64)
+        using acc_t = at::acc_type<scalar_t, /*is_cuda=*/true>;
+        const auto acc_dtype = c10::CppTypeToScalarType<acc_t>::value;
 
-        auto min_dists = at::empty({B, N}, points_contig.options());
-        auto curr_dists = at::empty({B, N}, points_contig.options());
+        auto min_dists = at::empty({B, N}, points_contig.options().dtype(acc_dtype));
+        auto curr_dists = at::empty({B, N}, points_contig.options().dtype(acc_dtype));
 
         const size_t shared_mem_bytes =
             static_cast<size_t>(D) * sizeof(acc_t);
         fps_with_knn_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE>
-            <<<blocks, BLOCK_SIZE, shared_mem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            <<<blocks, BLOCK_SIZE, shared_mem_bytes,
+               at::cuda::getCurrentCUDAStream()>>>(
                 points_contig.data_ptr<scalar_t>(),
                 mask_contig.data_ptr<bool>(),
                 start_contig.data_ptr<int64_t>(),
-                B,
-                N,
-                D,
-                K,
-                k_neighbors,
+                B, N, D, K, k_neighbors,
                 centroid_idx.data_ptr<int64_t>(),
                 neighbor_idx.data_ptr<int64_t>(),
                 min_dists.data_ptr<acc_t>(),

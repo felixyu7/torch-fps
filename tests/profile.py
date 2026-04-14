@@ -4,9 +4,16 @@ Performance profiling for FPS and FPS+kNN implementations.
 Compares optimized kernels against baselines across various problem sizes.
 """
 
+import sys
 import time
+from pathlib import Path
 import torch
 from typing import List, Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from torch_fps import farthest_point_sampling, farthest_point_sampling_with_knn
 from baselines import fps_baseline, fps_with_knn_baseline
 
@@ -15,42 +22,41 @@ from baselines import fps_baseline, fps_with_knn_baseline
 # Profiling Utilities
 # ============================================================================
 
-def benchmark_function(func, *args, warmup=3, iterations=10, sync_cuda=True):
+def benchmark_function(func, *args, warmup=5, iterations=20, sync_cuda=True):
     """
     Benchmark a function with warmup and multiple iterations.
+
+    Times a single block of `iterations` calls and reports the average. Block
+    timing (vs. per-call timing) keeps the OpenMP worker threads hot across
+    iterations; with per-call timing, threads can park between calls and
+    inflate CPU measurements by 10-30x on small kernels.
 
     Args:
         func: Function to benchmark
         *args: Arguments to pass to func
-        warmup: Number of warmup iterations
-        iterations: Number of timed iterations
-        sync_cuda: Whether to synchronize CUDA before timing
+        warmup: Number of warmup iterations (discarded)
+        iterations: Number of timed iterations in a single block
+        sync_cuda: Whether to synchronize CUDA around timing
 
     Returns:
-        Median time in milliseconds
+        Average time per iteration in milliseconds
     """
-    import statistics
-
-    # Warmup
+    # Generous warmup to populate L1/L2 caches and spin up OpenMP threads.
     for _ in range(warmup):
         _ = func(*args)
-        if sync_cuda and torch.cuda.is_available():
-            torch.cuda.synchronize()
+    if sync_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
-    # Timed runs - time each iteration individually for accuracy
-    times = []
+    # Single timed block. Pre-reading perf_counter right before the loop
+    # minimizes the window in which OpenMP threads could park.
+    start = time.perf_counter()
     for _ in range(iterations):
-        if sync_cuda and torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        start = time.perf_counter()
         _ = func(*args)
-        if sync_cuda and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
-        times.append(elapsed * 1000)  # Convert to ms
+    if sync_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    total_ms = (time.perf_counter() - start) * 1000
 
-    return statistics.median(times)  # Use median for robustness
+    return total_ms / iterations
 
 
 # ============================================================================
