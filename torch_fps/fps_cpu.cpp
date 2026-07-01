@@ -33,6 +33,7 @@ void fps_kernel_cpu_inner_parallel(
 
     // Init pass (serial — single linear scan, cheap enough).
     int64_t valid_count = 0;
+    int64_t n_eff = 0;  // (last valid index)+1; bounds the per-iteration sweeps
     for (int64_t n = 0; n < N; ++n) {
         bool is_valid = mask[n];
         if (is_valid) {
@@ -47,6 +48,7 @@ void fps_kernel_cpu_inner_parallel(
         if (is_valid) {
             min_dists[n] = inf;
             ++valid_count;
+            n_eff = n + 1;
         } else {
             min_dists[n] = neg_inf;
         }
@@ -89,7 +91,7 @@ void fps_kernel_cpu_inner_parallel(
         // Fused parallel_for: each thread updates min_dists for its range
         // AND tracks a local argmax in the same pass. Halves the
         // at::parallel_for launch overhead vs. two separate calls.
-        at::parallel_for(0, N, grain, [&](int64_t begin, int64_t end) {
+        at::parallel_for(0, n_eff, grain, [&](int64_t begin, int64_t end) {
             const int t = at::get_thread_num();
             acc_t best_v = locals[t].val;
             int64_t best_i = locals[t].idx;
@@ -152,6 +154,7 @@ void fps_kernel_cpu(
     std::vector<acc_t> min_dists(static_cast<size_t>(N));
 
     int64_t valid_count = 0;
+    int64_t n_eff = 0;  // (last valid index)+1; bounds the per-iteration sweeps
     const acc_t inf = std::numeric_limits<acc_t>::infinity();
     const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
 
@@ -169,6 +172,7 @@ void fps_kernel_cpu(
         if (is_valid) {
             min_dists[n] = inf;
             ++valid_count;
+            n_eff = n + 1;
         } else {
             min_dists[n] = neg_inf;
         }
@@ -192,7 +196,7 @@ void fps_kernel_cpu(
         //               min_dists = torch.minimum(min_dists, d)
         const scalar_t* centroid = points + last * D;
 
-        for (int64_t n = 0; n < N; ++n) {
+        for (int64_t n = 0; n < n_eff; ++n) {
             if (min_dists[n] == neg_inf) {
                 continue;  // invalid, NaN, or already-selected
             }
@@ -216,7 +220,7 @@ void fps_kernel_cpu(
         if (i + 1 < effective_k) {
             acc_t best_val = neg_inf;
             int64_t best_idx = last;
-            for (int64_t n = 0; n < N; ++n) {
+            for (int64_t n = 0; n < n_eff; ++n) {
                 if (min_dists[n] > best_val ||
                     (min_dists[n] == best_val && n < best_idx)) {
                     best_val = min_dists[n];
@@ -265,6 +269,7 @@ void fps_with_knn_kernel_cpu(
     std::vector<char> point_valid(static_cast<size_t>(N), 0);
 
     int64_t valid_count = 0;
+    int64_t n_eff = 0;  // (last valid index)+1; bounds the per-iteration sweeps
     const acc_t inf = std::numeric_limits<acc_t>::infinity();
     const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
 
@@ -283,6 +288,7 @@ void fps_with_knn_kernel_cpu(
         if (is_valid) {
             min_dists[n] = inf;
             ++valid_count;
+            n_eff = n + 1;
         } else {
             min_dists[n] = neg_inf;
         }
@@ -307,7 +313,7 @@ void fps_with_knn_kernel_cpu(
         KnnPair* row = knn_buffer.data() + i * k_neighbors;
         int64_t& row_size = knn_sizes[i];
 
-        for (int64_t n = 0; n < N; ++n) {
+        for (int64_t n = 0; n < n_eff; ++n) {
             if (!point_valid[n]) {
                 continue;
             }
@@ -343,7 +349,7 @@ void fps_with_knn_kernel_cpu(
         if (i + 1 < effective_k) {
             acc_t best_val = neg_inf;
             int64_t best_idx = last;
-            for (int64_t n = 0; n < N; ++n) {
+            for (int64_t n = 0; n < n_eff; ++n) {
                 if (min_dists[n] > best_val ||
                     (min_dists[n] == best_val && n < best_idx)) {
                     best_val = min_dists[n];

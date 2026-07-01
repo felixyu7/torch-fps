@@ -14,7 +14,33 @@
 namespace torch_fps {
 namespace {
 
-template <typename scalar_t, typename acc_t, int BLOCK_SIZE>
+// Squared L2 distance between a point and a (shared-memory) centroid.
+// VEC4 specialization: for D==4 float inputs, load the point as one aligned
+// 16-byte float4 instead of 4 scalar strided loads. The accumulation order is
+// identical to the scalar loop (d=0,1,2,3), so results are bit-identical.
+template <typename scalar_t, typename acc_t, bool VEC4>
+__device__ __forceinline__ acc_t squared_distance(
+    const scalar_t* __restrict__ point,
+    const acc_t* __restrict__ centroid,
+    int64_t D) {
+    if constexpr (VEC4) {
+        const float4 p = *reinterpret_cast<const float4*>(point);
+        const acc_t dx = static_cast<acc_t>(p.x) - centroid[0];
+        const acc_t dy = static_cast<acc_t>(p.y) - centroid[1];
+        const acc_t dz = static_cast<acc_t>(p.z) - centroid[2];
+        const acc_t dw = static_cast<acc_t>(p.w) - centroid[3];
+        return dx * dx + dy * dy + dz * dz + dw * dw;
+    } else {
+        acc_t dist = acc_t(0);
+        for (int64_t d = 0; d < D; ++d) {
+            const acc_t diff = static_cast<acc_t>(point[d]) - centroid[d];
+            dist += diff * diff;
+        }
+        return dist;
+    }
+}
+
+template <typename scalar_t, typename acc_t, int BLOCK_SIZE, bool VEC4>
 __global__ void fps_kernel_cuda(
     const scalar_t* __restrict__ points,
     const bool* __restrict__ mask,
@@ -41,6 +67,7 @@ __global__ void fps_kernel_cuda(
 
     __shared__ int64_t shared_last;
     __shared__ int64_t shared_counts[BLOCK_SIZE];
+    __shared__ int64_t shared_neff[BLOCK_SIZE];
     __shared__ acc_t shared_vals[BLOCK_SIZE];
     __shared__ int64_t shared_idx[BLOCK_SIZE];
 
@@ -52,7 +79,10 @@ __global__ void fps_kernel_cuda(
     const acc_t inf = std::numeric_limits<acc_t>::infinity();
     const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
 
+    // local_neff tracks (last valid index)+1 for this thread; grid-stride n is
+    // monotonically increasing so the final assignment is this thread's max.
     int64_t local_count = 0;
+    int64_t local_neff = 0;
     for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
         bool valid = batch_mask[n];
         if (valid) {
@@ -67,22 +97,32 @@ __global__ void fps_kernel_cuda(
         if (valid) {
             batch_min_dists[n] = inf;
             ++local_count;
+            local_neff = n + 1;
         } else {
             batch_min_dists[n] = neg_inf;
         }
     }
 
     shared_counts[threadIdx.x] = local_count;
+    shared_neff[threadIdx.x] = local_neff;
     __syncthreads();
 
     for (int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1) {
         if (threadIdx.x < offset) {
             shared_counts[threadIdx.x] += shared_counts[threadIdx.x + offset];
+            const int64_t other_neff = shared_neff[threadIdx.x + offset];
+            if (other_neff > shared_neff[threadIdx.x]) {
+                shared_neff[threadIdx.x] = other_neff;
+            }
         }
         __syncthreads();
     }
 
     const int64_t valid_count = shared_counts[0];
+    // Effective length: one past the last valid index. All points in [n_eff, N)
+    // are invalid, so bounding the per-iteration sweeps by n_eff (instead of N)
+    // is a no-op on results but skips padding work in ragged/padded batches.
+    const int64_t n_eff = shared_counts[0] == 0 ? 0 : shared_neff[0];
     const int64_t effective_k = valid_count < K ? valid_count : K;
     int64_t last = shared_last;
 
@@ -110,18 +150,14 @@ __global__ void fps_kernel_cuda(
         __syncthreads();
 
         // Phase 1: Update min_dists based on distance to current centroid
-        for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
+        for (int64_t n = threadIdx.x; n < n_eff; n += BLOCK_SIZE) {
             if (batch_min_dists[n] == neg_inf) {
                 continue;  // invalid, NaN, or already-selected
             }
 
             const scalar_t* point = batch_points + n * D;
-            acc_t dist = acc_t(0);
-            for (int64_t d = 0; d < D; ++d) {
-                const acc_t diff =
-                    static_cast<acc_t>(point[d]) - centroid_vals[d];
-                dist += diff * diff;
-            }
+            const acc_t dist =
+                squared_distance<scalar_t, acc_t, VEC4>(point, centroid_vals, D);
 
             if (dist < batch_min_dists[n]) {
                 batch_min_dists[n] = dist;
@@ -142,7 +178,7 @@ __global__ void fps_kernel_cuda(
             acc_t best_val = neg_inf;
             int64_t best_idx = 0;
 
-            for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
+            for (int64_t n = threadIdx.x; n < n_eff; n += BLOCK_SIZE) {
                 // argmax over all points (invalids have 0.0, selected have 0.0 after update)
                 const acc_t val = batch_min_dists[n];
                 if (val > best_val || (val == best_val && n < best_idx)) {
@@ -213,7 +249,7 @@ __global__ void fps_kernel_cuda(
 // Fused FPS + kNN kernel (optimized: compute distances during FPS)
 // ============================================================================
 
-template <typename scalar_t, typename acc_t, int BLOCK_SIZE>
+template <typename scalar_t, typename acc_t, int BLOCK_SIZE, bool VEC4>
 __global__ void fps_with_knn_kernel_cuda(
     const scalar_t* __restrict__ points,
     const bool* __restrict__ mask,
@@ -245,6 +281,7 @@ __global__ void fps_with_knn_kernel_cuda(
 
     __shared__ int64_t shared_last;
     __shared__ int64_t shared_counts[BLOCK_SIZE];
+    __shared__ int64_t shared_neff[BLOCK_SIZE];
     __shared__ acc_t shared_vals[BLOCK_SIZE];
     __shared__ int64_t shared_idx[BLOCK_SIZE];
 
@@ -256,7 +293,10 @@ __global__ void fps_with_knn_kernel_cuda(
     const acc_t inf = std::numeric_limits<acc_t>::infinity();
     const acc_t neg_inf = -std::numeric_limits<acc_t>::infinity();
 
+    // local_neff tracks (last valid index)+1 for this thread; grid-stride n is
+    // monotonically increasing so the final assignment is this thread's max.
     int64_t local_count = 0;
+    int64_t local_neff = 0;
     for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
         bool valid = batch_mask[n];
         if (valid) {
@@ -271,22 +311,32 @@ __global__ void fps_with_knn_kernel_cuda(
         if (valid) {
             batch_min_dists[n] = inf;
             ++local_count;
+            local_neff = n + 1;
         } else {
             batch_min_dists[n] = neg_inf;
         }
     }
 
     shared_counts[threadIdx.x] = local_count;
+    shared_neff[threadIdx.x] = local_neff;
     __syncthreads();
 
     for (int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1) {
         if (threadIdx.x < offset) {
             shared_counts[threadIdx.x] += shared_counts[threadIdx.x + offset];
+            const int64_t other_neff = shared_neff[threadIdx.x + offset];
+            if (other_neff > shared_neff[threadIdx.x]) {
+                shared_neff[threadIdx.x] = other_neff;
+            }
         }
         __syncthreads();
     }
 
     const int64_t valid_count = shared_counts[0];
+    // Effective length: one past the last valid index. All points in [n_eff, N)
+    // are invalid, so bounding the per-iteration sweeps by n_eff (instead of N)
+    // is a no-op on results but skips padding work in ragged/padded batches.
+    const int64_t n_eff = shared_counts[0] == 0 ? 0 : shared_neff[0];
     const int64_t effective_k = valid_count < K ? valid_count : K;
     int64_t last = shared_last;
 
@@ -316,18 +366,13 @@ __global__ void fps_with_knn_kernel_cuda(
         }
         __syncthreads();
 
-        for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
+        for (int64_t n = threadIdx.x; n < n_eff; n += BLOCK_SIZE) {
             acc_t dist;
             if (!batch_mask[n]) {
                 dist = inf;
             } else {
                 const scalar_t* point = batch_points + n * D;
-                dist = acc_t(0);
-                for (int64_t d = 0; d < D; ++d) {
-                    const acc_t diff =
-                        static_cast<acc_t>(point[d]) - centroid_vals[d];
-                    dist += diff * diff;
-                }
+                dist = squared_distance<scalar_t, acc_t, VEC4>(point, centroid_vals, D);
                 // NaN-coord points produce dist=NaN; promote to inf so the
                 // argmin has well-defined ordering. Self-inequality detects NaN.
                 if (!(dist == dist)) {
@@ -360,7 +405,7 @@ __global__ void fps_with_knn_kernel_cuda(
             acc_t best_val = inf;
             int64_t best_idx = 0;
 
-            for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
+            for (int64_t n = threadIdx.x; n < n_eff; n += BLOCK_SIZE) {
                 const acc_t val = batch_curr_dists[n];
                 if (val < best_val || (val == best_val && n < best_idx)) {
                     best_val = val;
@@ -407,7 +452,7 @@ __global__ void fps_with_knn_kernel_cuda(
             acc_t best_val = neg_inf;
             int64_t best_idx = 0;
 
-            for (int64_t n = threadIdx.x; n < N; n += BLOCK_SIZE) {
+            for (int64_t n = threadIdx.x; n < n_eff; n += BLOCK_SIZE) {
                 const acc_t val = batch_min_dists[n];
                 if (val > best_val || (val == best_val && n < best_idx)) {
                     best_val = val;
@@ -505,17 +550,25 @@ at::Tensor fps_forward_cuda(
             at::empty({B, N}, points_contig.options().dtype(acc_dtype));
         const size_t shared_mem_bytes =
             static_cast<size_t>(D) * sizeof(acc_t);
-        fps_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE>
-            <<<blocks, BLOCK_SIZE, shared_mem_bytes, at::cuda::getCurrentCUDAStream()>>>(
-                points_contig.data_ptr<scalar_t>(),
-                mask_contig.data_ptr<bool>(),
-                start_contig.data_ptr<int64_t>(),
-                B,
-                N,
-                D,
-                K,
-                idx.data_ptr<int64_t>(),
-                min_dists.data_ptr<acc_t>());
+        auto stream = at::cuda::getCurrentCUDAStream();
+        auto launch = [&](auto vec_tag) {
+            constexpr bool VEC4 = decltype(vec_tag)::value;
+            fps_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE, VEC4>
+                <<<blocks, BLOCK_SIZE, shared_mem_bytes, stream>>>(
+                    points_contig.data_ptr<scalar_t>(),
+                    mask_contig.data_ptr<bool>(),
+                    start_contig.data_ptr<int64_t>(),
+                    B, N, D, K,
+                    idx.data_ptr<int64_t>(),
+                    min_dists.data_ptr<acc_t>());
+        };
+        // float4 fast path only for D==4 float inputs (points are 16B-aligned).
+        if constexpr (std::is_same_v<scalar_t, float>) {
+            if (D == 4) { launch(std::true_type{}); }
+            else { launch(std::false_type{}); }
+        } else {
+            launch(std::false_type{});
+        }
     });
 
     AT_CUDA_CHECK(cudaGetLastError());
@@ -581,17 +634,27 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
 
         const size_t shared_mem_bytes =
             static_cast<size_t>(D) * sizeof(acc_t);
-        fps_with_knn_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE>
-            <<<blocks, BLOCK_SIZE, shared_mem_bytes,
-               at::cuda::getCurrentCUDAStream()>>>(
-                points_contig.data_ptr<scalar_t>(),
-                mask_contig.data_ptr<bool>(),
-                start_contig.data_ptr<int64_t>(),
-                B, N, D, K, k_neighbors,
-                centroid_idx.data_ptr<int64_t>(),
-                neighbor_idx.data_ptr<int64_t>(),
-                min_dists.data_ptr<acc_t>(),
-                curr_dists.data_ptr<acc_t>());
+        auto stream = at::cuda::getCurrentCUDAStream();
+        auto launch = [&](auto vec_tag) {
+            constexpr bool VEC4 = decltype(vec_tag)::value;
+            fps_with_knn_kernel_cuda<scalar_t, acc_t, BLOCK_SIZE, VEC4>
+                <<<blocks, BLOCK_SIZE, shared_mem_bytes, stream>>>(
+                    points_contig.data_ptr<scalar_t>(),
+                    mask_contig.data_ptr<bool>(),
+                    start_contig.data_ptr<int64_t>(),
+                    B, N, D, K, k_neighbors,
+                    centroid_idx.data_ptr<int64_t>(),
+                    neighbor_idx.data_ptr<int64_t>(),
+                    min_dists.data_ptr<acc_t>(),
+                    curr_dists.data_ptr<acc_t>());
+        };
+        // float4 fast path only for D==4 float inputs (points are 16B-aligned).
+        if constexpr (std::is_same_v<scalar_t, float>) {
+            if (D == 4) { launch(std::true_type{}); }
+            else { launch(std::false_type{}); }
+        } else {
+            launch(std::false_type{});
+        }
 
         AT_CUDA_CHECK(cudaGetLastError());
     });
