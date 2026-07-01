@@ -449,6 +449,65 @@ class TestImportErrorChain:
             fps_mod._import_error = saved_err
 
 
+class TestValidateFlag:
+    """validate=False must skip the host-sync checks without changing results."""
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    @pytest.mark.parametrize("random_start", [False, True])
+    def test_fps_parity(self, device, random_start):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(42)
+        points = torch.randn(4, 128, 4, device=device)
+        mask = torch.ones(4, 128, dtype=torch.bool, device=device)
+        mask[1, 96:] = False
+        gen_a = torch.Generator(device=device).manual_seed(7)
+        gen_b = torch.Generator(device=device).manual_seed(7)
+        idx_a = farthest_point_sampling(
+            points, mask, 32, random_start=random_start, generator=gen_a, validate=True
+        )
+        idx_b = farthest_point_sampling(
+            points, mask, 32, random_start=random_start, generator=gen_b, validate=False
+        )
+        assert torch.equal(idx_a, idx_b)
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_fused_parity(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(42)
+        points = torch.randn(4, 128, 4, device=device)
+        mask = torch.ones(4, 128, dtype=torch.bool, device=device)
+        mask[2, 100:] = False
+        out_a = farthest_point_sampling_with_knn(
+            points, mask, 32, 8, random_start=False, validate=True
+        )
+        out_b = farthest_point_sampling_with_knn(
+            points, mask, 32, 8, random_start=False, validate=False
+        )
+        assert torch.equal(out_a[0], out_b[0])
+        assert torch.equal(out_a[1], out_b[1])
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_supplied_start_parity(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(42)
+        points = torch.randn(3, 64, 4, device=device)
+        mask = torch.ones(3, 64, dtype=torch.bool, device=device)
+        start = torch.tensor([5, 0, 63], device=device)
+        idx_a = farthest_point_sampling(points, mask, 16, start_idx=start, validate=True)
+        idx_b = farthest_point_sampling(points, mask, 16, start_idx=start, validate=False)
+        assert torch.equal(idx_a, idx_b)
+
+    def test_validate_true_still_raises(self):
+        points = torch.randn(2, 10, 3)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        mask[0, 5:] = False  # only 5 valid points, K=8
+        with pytest.raises(ValueError, match="K <= number of valid points"):
+            farthest_point_sampling(points, mask, 8, random_start=False, validate=True)
+
+
 if __name__ == "__main__":
     # Run tests without pytest
     print("Running FPS correctness tests...")

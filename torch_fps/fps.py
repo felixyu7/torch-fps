@@ -23,7 +23,7 @@ def _require_extension() -> None:
 
 def _resolve_start_idx(
     mask_c: Tensor,
-    counts: Tensor,
+    counts: Optional[Tensor],
     B: int,
     N: int,
     K: int,
@@ -32,6 +32,7 @@ def _resolve_start_idx(
     start_idx: Optional[Tensor],
     random_start: bool,
     generator: Optional[torch.Generator],
+    validate: bool = True,
 ) -> Tensor:
     """Produce a validated contiguous [B] long start_idx with minimal GPU syncs.
 
@@ -39,15 +40,18 @@ def _resolve_start_idx(
     the valid mask, so every index is valid by construction and no further
     validation sync is required. On the user-supplied path we fuse the
     K<=counts, range, and mask-validity checks into a single `.any()` sync.
+    With ``validate=False`` the checks (and their host sync) are skipped
+    entirely; ``counts`` may then be None on the ``start_idx is None`` path.
     """
     if start_idx is None:
         # Fast path: multinomial is unbiased and guarantees valid indices.
-        problems = counts < K
-        if bool(problems.any()):
-            raise ValueError(
-                f"FPS requires K <= number of valid points. "
-                f"Found batch(es) with K={K} but fewer valid points."
-            )
+        if validate:
+            problems = counts < K
+            if bool(problems.any()):
+                raise ValueError(
+                    f"FPS requires K <= number of valid points. "
+                    f"Found batch(es) with K={K} but fewer valid points."
+                )
         if not random_start:
             return torch.zeros(B, device=device, dtype=torch.long).contiguous()
         # multinomial needs fp32/fp64 probabilities regardless of the kernel precision.
@@ -67,16 +71,17 @@ def _resolve_start_idx(
         raise ValueError("start_idx must have shape [B]")
     start_idx = start_idx.reshape(B)
 
-    out_of_range = (start_idx < 0) | (start_idx >= N)
-    insufficient = counts < K
-    problems = out_of_range | insufficient
-    if bool(problems.any()):
-        if bool(insufficient.any()):
-            raise ValueError(
-                f"FPS requires K <= number of valid points. "
-                f"Found batch(es) with K={K} but fewer valid points."
-            )
-        raise ValueError("start_idx values must be within [0, N)")
+    if validate:
+        out_of_range = (start_idx < 0) | (start_idx >= N)
+        insufficient = counts < K
+        problems = out_of_range | insufficient
+        if bool(problems.any()):
+            if bool(insufficient.any()):
+                raise ValueError(
+                    f"FPS requires K <= number of valid points. "
+                    f"Found batch(es) with K={K} but fewer valid points."
+                )
+            raise ValueError("start_idx values must be within [0, N)")
 
     # Repair any start index that points to a masked-out slot. Avoid the
     # extra sync on the common "already valid" path by skipping the repair
@@ -99,6 +104,7 @@ def farthest_point_sampling(
     random_start: bool = True,
     generator: Optional[torch.Generator] = None,
     precision: Optional[torch.dtype] = None,
+    validate: bool = True,
 ) -> Tensor:
     """
     Farthest point sampling with native CPU/CUDA acceleration.
@@ -122,6 +128,14 @@ def farthest_point_sampling(
             Optional dtype for internal computations. If None (default), uses float32 on all
             devices for numerical stability. Can override: float16, float32, float64 (CPU/GPU)
             or bfloat16 (GPU only).
+        validate:
+            If `True` (default), verify `K <= valid count` per batch row (and
+            range-check a user-supplied `start_idx`). The check costs one
+            host-device sync per call; callers that already guarantee the
+            precondition (e.g. by construction of their batches) can pass
+            `False` to keep the call fully asynchronous. With `validate=False`
+            a violated precondition is NOT diagnosed: the kernel pads the
+            output with repeated indices instead of raising.
 
     Returns:
         idx:
@@ -165,11 +179,16 @@ def farthest_point_sampling(
     points_c = points.contiguous()
     mask_c = valid_mask.contiguous()
 
-    counts = mask_c.sum(dim=1, dtype=torch.long)
+    # counts feeds validation and the user-supplied start repair; skip the
+    # kernel entirely when neither needs it (validate=False, start_idx=None).
+    counts = (
+        mask_c.sum(dim=1, dtype=torch.long)
+        if (validate or start_idx is not None) else None
+    )
 
     start_idx = _resolve_start_idx(
         mask_c, counts, B, N, K, dtype, device,
-        start_idx, random_start, generator,
+        start_idx, random_start, generator, validate,
     )
 
     _require_extension()
@@ -186,6 +205,7 @@ def farthest_point_sampling_with_knn(
     random_start: bool = True,
     generator: Optional[torch.Generator] = None,
     precision: Optional[torch.dtype] = None,
+    validate: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """
     Fused farthest point sampling + k-nearest neighbors with native CPU/CUDA acceleration.
@@ -216,6 +236,12 @@ def farthest_point_sampling_with_knn(
             Optional dtype for internal computations. If None (default), uses float32 on all
             devices for numerical stability. Can override: float16, float32, float64 (CPU/GPU)
             or bfloat16 (GPU only).
+        validate:
+            If `True` (default), verify `K <= valid count` per batch row (and
+            range-check a user-supplied `start_idx`) at the cost of one
+            host-device sync per call. Pass `False` when the caller guarantees
+            the precondition to keep the call fully asynchronous; violations
+            are then NOT diagnosed (the kernel pads with repeated indices).
 
     Returns:
         centroid_idx:
@@ -278,11 +304,14 @@ def farthest_point_sampling_with_knn(
     points_c = points.contiguous()
     mask_c = valid_mask.contiguous()
 
-    counts = mask_c.sum(dim=1, dtype=torch.long)
+    counts = (
+        mask_c.sum(dim=1, dtype=torch.long)
+        if (validate or start_idx is not None) else None
+    )
 
     start_idx = _resolve_start_idx(
         mask_c, counts, B, N, K, dtype, device,
-        start_idx, random_start, generator,
+        start_idx, random_start, generator, validate,
     )
 
     _require_extension()
