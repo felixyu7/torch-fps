@@ -508,6 +508,119 @@ class TestValidateFlag:
             farthest_point_sampling(points, mask, 8, random_start=False, validate=True)
 
 
+class TestSyncFree:
+    """validate=False calls must not synchronize the host (Neptune's contract)."""
+
+    @pytest.mark.parametrize("random_start", [False, True])
+    def test_no_sync_validate_false(self, random_start):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(42)
+        points = torch.randn(4, 128, 4, device="cuda")
+        mask = torch.ones(4, 128, dtype=torch.bool, device="cuda")
+        mask[1, 96:] = False
+        # Warm up lazy CUDA state outside the guarded region.
+        farthest_point_sampling(points, mask, 8, random_start=random_start, validate=False)
+        farthest_point_sampling_with_knn(points, mask, 8, 4, random_start=random_start, validate=False)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode(2)
+        try:
+            idx = farthest_point_sampling(
+                points, mask, 32, random_start=random_start, validate=False
+            )
+            cent, neigh = farthest_point_sampling_with_knn(
+                points, mask, 32, 8, random_start=random_start, validate=False
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+        assert idx.shape == (4, 32)
+        assert cent.shape == (4, 32) and neigh.shape == (4, 32, 8)
+
+
+class TestImplicitStart:
+    """random_start=False without start_idx must start at the first valid index."""
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_masked_index_zero(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(42)
+        points = torch.randn(3, 64, 4, device=device)
+        mask = torch.ones(3, 64, dtype=torch.bool, device=device)
+        mask[0, 0] = False    # first valid is 1
+        mask[2, :10] = False  # first valid is 10
+        idx = farthest_point_sampling(points, mask, 16, random_start=False)
+        assert idx[0, 0].item() == 1
+        assert idx[1, 0].item() == 0
+        assert idx[2, 0].item() == 10
+        assert bool(mask.gather(1, idx).all()), "selected a masked-out point"
+        # Parity with explicitly supplying the repaired starts.
+        start = torch.tensor([1, 0, 10], device=device)
+        idx_b = farthest_point_sampling(points, mask, 16, start_idx=start, random_start=False)
+        assert torch.equal(idx, idx_b)
+
+
+class TestStorageOffset:
+    """Contiguous views with a storage offset must not take the float4 path unaligned."""
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_misaligned_d4(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(42)
+        B, N = 4, 128
+        flat = torch.randn(B * N * 4 + 1, device=device)
+        pts = flat.narrow(0, 1, B * N * 4).view(B, N, 4)  # contiguous, 4-byte offset
+        assert pts.is_contiguous() and pts.storage_offset() == 1
+        mask = torch.ones(B, N, dtype=torch.bool, device=device)
+        idx = farthest_point_sampling(pts, mask, 16, random_start=False)
+        idx_ref = farthest_point_sampling(pts.clone(), mask, 16, random_start=False)
+        assert torch.equal(idx, idx_ref)
+        cent, neigh = farthest_point_sampling_with_knn(pts, mask, 16, 8, random_start=False)
+        cent_ref, neigh_ref = farthest_point_sampling_with_knn(
+            pts.clone(), mask, 16, 8, random_start=False
+        )
+        assert torch.equal(cent, cent_ref) and torch.equal(neigh, neigh_ref)
+
+
+class TestEmptyBatch:
+    """B=0 must return empty index tensors instead of a failed kernel launch."""
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_b0(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        points = torch.randn(0, 32, 4, device=device)
+        mask = torch.ones(0, 32, dtype=torch.bool, device=device)
+        idx = farthest_point_sampling(points, mask, 8, random_start=False)
+        assert idx.shape == (0, 8)
+        cent, neigh = farthest_point_sampling_with_knn(points, mask, 8, 4, random_start=False)
+        assert cent.shape == (0, 8) and neigh.shape == (0, 8, 4)
+
+
+class TestCrossDeviceParity:
+    """CPU and CUDA must select identical indices on identical inputs."""
+
+    def test_fps_and_fused_equal(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        torch.manual_seed(1234)
+        points = torch.randn(4, 128, 4)
+        mask = torch.ones(4, 128, dtype=torch.bool)
+        mask[1, 96:] = False
+        idx_cpu = farthest_point_sampling(points, mask, 32, random_start=False)
+        idx_gpu = farthest_point_sampling(points.cuda(), mask.cuda(), 32, random_start=False)
+        assert torch.equal(idx_cpu, idx_gpu.cpu())
+        cent_cpu, neigh_cpu = farthest_point_sampling_with_knn(
+            points, mask, 32, 8, random_start=False
+        )
+        cent_gpu, neigh_gpu = farthest_point_sampling_with_knn(
+            points.cuda(), mask.cuda(), 32, 8, random_start=False
+        )
+        assert torch.equal(cent_cpu, cent_gpu.cpu())
+        assert torch.equal(neigh_cpu, neigh_gpu.cpu())
+
+
 if __name__ == "__main__":
     # Run tests without pytest
     print("Running FPS correctness tests...")

@@ -78,6 +78,8 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward(
 }  // namespace torch_fps
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // Release the GIL: bodies are pure ATen (the CPU path runs multi-ms
+    // at::parallel_for loops that would otherwise block all Python threads).
     m.def(
         "fps_forward",
         &torch_fps::fps_forward,
@@ -85,7 +87,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("points"),
         pybind11::arg("mask"),
         pybind11::arg("start_idx"),
-        pybind11::arg("K"));
+        pybind11::arg("K"),
+        pybind11::call_guard<pybind11::gil_scoped_release>());
 
     m.def(
         "fps_with_knn_forward",
@@ -95,6 +98,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("mask"),
         pybind11::arg("start_idx"),
         pybind11::arg("K"),
-        pybind11::arg("k_neighbors"));
+        pybind11::arg("k_neighbors"),
+        pybind11::call_guard<pybind11::gil_scoped_release>());
 }
 

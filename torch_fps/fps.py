@@ -22,6 +22,7 @@ def _require_extension() -> None:
 
 
 def _resolve_start_idx(
+    points_c: Tensor,
     mask_c: Tensor,
     counts: Optional[Tensor],
     B: int,
@@ -36,15 +37,18 @@ def _resolve_start_idx(
 ) -> Tensor:
     """Produce a validated contiguous [B] long start_idx with minimal GPU syncs.
 
-    On the random-start path the result is sampled via torch.multinomial from
-    the valid mask, so every index is valid by construction and no further
-    validation sync is required. On the user-supplied path we fuse the
-    K<=counts, range, and mask-validity checks into a single `.any()` sync.
-    With ``validate=False`` the checks (and their host sync) are skipped
-    entirely; ``counts`` may then be None on the ``start_idx is None`` path.
+    Start selection honors the kernels' validity semantics: a point is
+    selectable only if it is mask-true AND has no NaN coordinate. The fused
+    mask costs one elementwise [B, N, D] pass — negligible next to the
+    O(K*N*D) kernel. On the user-supplied path we fuse the K<=counts, range,
+    and mask-validity checks into a single `.any()` sync. With
+    ``validate=False`` the checks (and their host sync) are skipped entirely;
+    ``counts`` may then be None on the ``start_idx is None`` path. All start
+    resolution is pure-tensor: no host-device sync beyond validation.
     """
+    valid = mask_c & ~points_c.isnan().any(dim=-1)
+
     if start_idx is None:
-        # Fast path: multinomial is unbiased and guarantees valid indices.
         if validate:
             problems = counts < K
             if bool(problems.any()):
@@ -53,20 +57,26 @@ def _resolve_start_idx(
                     f"Found batch(es) with K={K} but fewer valid points."
                 )
         if not random_start:
-            return torch.zeros(B, device=device, dtype=torch.long).contiguous()
-        # multinomial needs fp32/fp64 probabilities regardless of the kernel precision.
-        probs = mask_c.to(torch.float32)
-        if generator is not None:
-            drawn = torch.multinomial(probs, 1, generator=generator)
-        else:
-            drawn = torch.multinomial(probs, 1)
-        return drawn.squeeze(-1).to(torch.long).contiguous()
+            # Deterministic start: first valid index per row (all-invalid rows
+            # give 0; the kernel pads those rows anyway).
+            return valid.long().argmax(dim=1).contiguous()
+        # Random start: masked-random argmax draws uniformly over valid points
+        # without multinomial's fp32 prob copy. All-invalid rows argmax to 0,
+        # matching the kernel's documented pad behavior.
+        scores = torch.rand(B, N, device=device, generator=generator)
+        scores = torch.where(valid, scores, float("-inf"))
+        return scores.argmax(dim=1).contiguous()
 
     # User-supplied path. Fuse all validation into a single sync. Bad
-    # inputs (K>counts, out-of-range) raise; a start_idx that points to a
-    # masked-out slot is silently repaired to the first valid index in that
-    # row, matching the Python baseline's behavior.
-    start_idx = start_idx.to(device=device, dtype=torch.long)
+    # inputs (K>counts, out-of-range) raise; a start_idx that points to an
+    # invalid slot (masked out or NaN) is silently repaired to the first
+    # valid index in that row, matching the Python baseline's behavior.
+    if start_idx.device != device:
+        raise ValueError(
+            "start_idx must be on the same device as points (a cross-device "
+            "copy here would silently synchronize the host)"
+        )
+    start_idx = start_idx.to(dtype=torch.long)
     if start_idx.numel() != B:
         raise ValueError("start_idx must have shape [B]")
     start_idx = start_idx.reshape(B)
@@ -83,14 +93,14 @@ def _resolve_start_idx(
                 )
             raise ValueError("start_idx values must be within [0, N)")
 
-    # Repair any start index that points to a masked-out slot. Avoid the
+    # Repair any start index that points to an invalid slot. Avoid the
     # extra sync on the common "already valid" path by skipping the repair
     # when counts>0 implies at least one valid index exists. The repair is
     # pure-tensor: no sync.
     has_valid = counts > 0
     safe_start = start_idx.clamp(0, max(N - 1, 0))
-    supplied_valid = mask_c.gather(1, safe_start.unsqueeze(-1)).squeeze(-1)
-    first_valid = torch.argmax(mask_c.long(), dim=1)
+    supplied_valid = valid.gather(1, safe_start.unsqueeze(-1)).squeeze(-1)
+    first_valid = torch.argmax(valid.long(), dim=1)
     repaired = torch.where(supplied_valid | ~has_valid, start_idx, first_valid)
     return repaired.contiguous()
 
@@ -119,9 +129,14 @@ def farthest_point_sampling(
             Must satisfy `K <= number of valid points` for all batches.
         start_idx:
             Optional `[B]` long tensor providing the first index per batch.
+            Must live on the same device as `points`; an index pointing at an
+            invalid slot (masked out or NaN) is repaired to the row's first
+            valid index.
         random_start:
             If `True` (default) and `start_idx` is not supplied, draw a random
-            first index from valid points.
+            first index from valid points (mask-true and NaN-free). If `False`
+            and `start_idx` is not supplied, the row's first valid index is
+            used.
         generator:
             Optional `torch.Generator` used for deterministic random starts.
         precision:
@@ -187,7 +202,7 @@ def farthest_point_sampling(
     )
 
     start_idx = _resolve_start_idx(
-        mask_c, counts, B, N, K, dtype, device,
+        points_c, mask_c, counts, B, N, K, dtype, device,
         start_idx, random_start, generator, validate,
     )
 
@@ -227,9 +242,14 @@ def farthest_point_sampling_with_knn(
             Must satisfy `k_neighbors <= N`.
         start_idx:
             Optional `[B]` long tensor providing the first index per batch.
+            Must live on the same device as `points`; an index pointing at an
+            invalid slot (masked out or NaN) is repaired to the row's first
+            valid index.
         random_start:
             If `True` (default) and `start_idx` is not supplied, draw a random
-            first index from valid points.
+            first index from valid points (mask-true and NaN-free). If `False`
+            and `start_idx` is not supplied, the row's first valid index is
+            used.
         generator:
             Optional `torch.Generator` used for deterministic random starts.
         precision:
@@ -310,7 +330,7 @@ def farthest_point_sampling_with_knn(
     )
 
     start_idx = _resolve_start_idx(
-        mask_c, counts, B, N, K, dtype, device,
+        points_c, mask_c, counts, B, N, K, dtype, device,
         start_idx, random_start, generator, validate,
     )
 

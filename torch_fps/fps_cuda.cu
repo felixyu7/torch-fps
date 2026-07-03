@@ -540,6 +540,9 @@ at::Tensor fps_forward_cuda(
                              .dtype(at::kLong)
                              .device(points_contig.device()));
 
+    // An empty batch would launch gridDim.x == 0 (cudaErrorInvalidConfiguration).
+    if (B == 0) { return idx; }
+
     constexpr int BLOCK_SIZE = 256;
     const dim3 blocks(static_cast<unsigned int>(B));
 
@@ -562,9 +565,12 @@ at::Tensor fps_forward_cuda(
                     idx.data_ptr<int64_t>(),
                     min_dists.data_ptr<acc_t>());
         };
-        // float4 fast path only for D==4 float inputs (points are 16B-aligned).
+        // float4 fast path only for 16B-aligned D==4 float inputs; contiguous
+        // tensors can carry a storage offset that breaks base alignment.
         if constexpr (std::is_same_v<scalar_t, float>) {
-            if (D == 4) { launch(std::true_type{}); }
+            const bool aligned16 =
+                reinterpret_cast<uintptr_t>(points_contig.data_ptr<scalar_t>()) % 16 == 0;
+            if (D == 4 && aligned16) { launch(std::true_type{}); }
             else { launch(std::false_type{}); }
         } else {
             launch(std::false_type{});
@@ -617,13 +623,16 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
                                        .dtype(at::kLong)
                                        .device(points_contig.device()));
 
-    constexpr int BLOCK_SIZE = 256;
-    const dim3 blocks(static_cast<unsigned int>(B));
-
     auto neighbor_idx = at::empty({B, K, k_neighbors},
                                   at::TensorOptions()
                                       .dtype(at::kLong)
                                       .device(points_contig.device()));
+
+    // An empty batch would launch gridDim.x == 0 (cudaErrorInvalidConfiguration).
+    if (B == 0) { return std::make_tuple(centroid_idx, neighbor_idx); }
+
+    constexpr int BLOCK_SIZE = 256;
+    const dim3 blocks(static_cast<unsigned int>(B));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, points_contig.scalar_type(), "fps_with_knn_forward_cuda", [&] {
         using acc_t = at::acc_type<scalar_t, /*is_cuda=*/true>;
@@ -648,9 +657,12 @@ std::tuple<at::Tensor, at::Tensor> fps_with_knn_forward_cuda(
                     min_dists.data_ptr<acc_t>(),
                     curr_dists.data_ptr<acc_t>());
         };
-        // float4 fast path only for D==4 float inputs (points are 16B-aligned).
+        // float4 fast path only for 16B-aligned D==4 float inputs; contiguous
+        // tensors can carry a storage offset that breaks base alignment.
         if constexpr (std::is_same_v<scalar_t, float>) {
-            if (D == 4) { launch(std::true_type{}); }
+            const bool aligned16 =
+                reinterpret_cast<uintptr_t>(points_contig.data_ptr<scalar_t>()) % 16 == 0;
+            if (D == 4 && aligned16) { launch(std::true_type{}); }
             else { launch(std::false_type{}); }
         } else {
             launch(std::false_type{});
