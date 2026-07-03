@@ -28,7 +28,6 @@ def _resolve_start_idx(
     B: int,
     N: int,
     K: int,
-    dtype: torch.dtype,
     device: torch.device,
     start_idx: Optional[Tensor],
     random_start: bool,
@@ -174,11 +173,9 @@ def farthest_point_sampling(
 
     # Determine precision: default to float32 on all devices for stability
     if precision is None:
-        dtype = torch.float32
         if points.dtype != torch.float32:
             points = points.to(dtype=torch.float32)
     else:
-        dtype = precision
         # Validate precision
         if device.type == 'cpu' and precision == torch.bfloat16:
             raise ValueError("bfloat16 is not supported on CPU (use float16, float32, or float64)")
@@ -202,7 +199,7 @@ def farthest_point_sampling(
     )
 
     start_idx = _resolve_start_idx(
-        points_c, mask_c, counts, B, N, K, dtype, device,
+        points_c, mask_c, counts, B, N, K, device,
         start_idx, random_start, generator, validate,
     )
 
@@ -297,11 +294,9 @@ def farthest_point_sampling_with_knn(
 
     # Determine precision: default to float32 on all devices for stability
     if precision is None:
-        dtype = torch.float32
         if points.dtype != torch.float32:
             points = points.to(dtype=torch.float32)
     else:
-        dtype = precision
         # Validate precision
         if device.type == 'cpu' and precision == torch.bfloat16:
             raise ValueError("bfloat16 is not supported on CPU (use float16, float32, or float64)")
@@ -330,7 +325,7 @@ def farthest_point_sampling_with_knn(
     )
 
     start_idx = _resolve_start_idx(
-        points_c, mask_c, counts, B, N, K, dtype, device,
+        points_c, mask_c, counts, B, N, K, device,
         start_idx, random_start, generator, validate,
     )
 
