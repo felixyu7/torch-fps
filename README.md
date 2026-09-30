@@ -1,68 +1,103 @@
 # torch-fps
 
-Optimized standard farthest point sampling (FPS) for PyTorch written in C++.
+Farthest point sampling (FPS) for PyTorch, with fused FPS + kNN and FPS +
+nearest-centroid assignment. On CUDA it runs Triton kernels that are compiled
+just-in-time for the local GPU. On CPU it runs C++ kernels that are compiled
+just-in-time on first use. Elsewhere (and for CUDA `precision=torch.float64`)
+it falls back to a pure-PyTorch implementation with the same semantics.
 
 ## Install
 
-`torch-fps` is currently published as a source distribution, so `pip` builds the
-extension locally during install.
-
 ```bash
-# First install a PyTorch build that matches your platform and CUDA version.
-# Example for CUDA 12.8:
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-
-# Then build torch-fps against that exact Torch install.
-pip install --no-build-isolation torch-fps
+pip install torch-fps
 ```
 
-**Note**: Ensure `gcc > 9` and `< 14`. Install can take a while because it is
-built from source. `--no-build-isolation` is recommended so `pip` uses your
-existing PyTorch install instead of creating a temporary build environment with
-a different Torch/CUDA combination.
+This is a pure-Python package. Nothing is compiled at install time, and the
+only dependency is `torch>=2.7`. The CUDA path also needs `triton>=3.3`, which
+Linux CUDA builds of PyTorch 2.7+ already ship. If CUDA is available but
+Triton is not, you get one `RuntimeWarning` and the reference backend.
 
-## Usage
+A C++ compiler is optional and makes CPU calls much faster. With one on the
+path, the first CPU call builds the C++ backend (FPS and FPS + kNN) through
+`torch.utils.cpp_extension`, which takes about 15 s once and is then cached in
+`~/.cache/torch_extensions` (or `$TORCH_EXTENSIONS_DIR`). Without a compiler
+you get one `RuntimeWarning` and the pure-PyTorch backend. OpenMP is used on
+Linux and Windows; on macOS it is opt-in with `TORCH_FPS_OPENMP=1`, and
+`TORCH_FPS_OPENMP=0` turns it off everywhere.
+
+## API
 
 ```python
-import torch
-from torch_fps import farthest_point_sampling, farthest_point_sampling_with_knn
+from torch_fps import (
+    farthest_point_sampling,              # -> idx [B, k]
+    farthest_point_sampling_with_knn,     # -> idx [B, k], neighbours [B, k, k_neighbors]
+    farthest_point_sampling_with_assign,  # -> idx [B, k], assign [B, N] in [0, k)
+    nearest_assign,                       # flat segmented points -> [N] in [0, k)
+)
 
-# Create example inputs
-points = torch.randn(4, 1000, 3)     # [B, N, D] - batch of point clouds
-mask = torch.ones(4, 1000, dtype=torch.bool)  # [B, N] - valid point mask
-K = 512  # Number of samples per batch (must be <= number of valid points)
+points = torch.randn(4, 1000, 3, device="cuda")   # [B, N, D]
+mask = torch.ones(4, 1000, dtype=torch.bool, device="cuda")
 
-# Perform farthest point sampling
-idx = farthest_point_sampling(points, mask, K)  # [B, K] - selected point indices
-
-# Use indices to gather sampled points
-sampled_points = points.gather(1, idx.unsqueeze(-1).expand(-1, -1, 3))  # [B, K, D]
-
-# Fused FPS + kNN: get centroids and their k nearest neighbors in one pass
-centroid_idx, neighbor_idx = farthest_point_sampling_with_knn(
-    points, mask, K=512, k_neighbors=32
-)  # centroid_idx: [B, K], neighbor_idx: [B, K, k_neighbors]
+idx = farthest_point_sampling(points, mask, 128)
+idx, nbr = farthest_point_sampling_with_knn(points, mask, 128, 16)
+idx, assign = farthest_point_sampling_with_assign(points, mask, 128)
 ```
+
+The three FPS functions share these keyword-only options:
+
+| Option | Default | Effect |
+|-|-|-|
+| `start_idx` | `None` | Explicit `[B]` first index per row. |
+| `random_start` | `True` | Random valid first index. When `False`, the first valid index is used. |
+| `generator` | `None` | Generator for the random start. |
+| `precision` | `None` | Input dtype. `None` means float32. Distances always accumulate in fp32, or fp64 with `precision=torch.float64`. |
+| `validate` | `True` | Checks `k <= valid count`, which costs one host sync. With `False` the call is sync-free and short rows pad by repeating their last pick. |
+| `assume_finite` | `False` | Skips the finiteness pass over the points. |
+
+Other semantics:
+
+- A point is valid when its mask entry is true and all its coordinates are finite.
+- Ties go to the lowest index.
+- kNN neighbours are sorted closest-first and include the centroid. Rows with fewer than `k_neighbors` valid points pad with the centroid index.
+
+All backends agree up to fp32 rounding. Triton (and C++, where the compiler
+fuses multiply-adds) can occasionally resolve exact near-ties differently.
+
+Breaking change from 0.5: the sample count argument is now `k`, not `K`.
 
 ## Performance
 
-Benchmarked on AMD Threadripper 7970X and NVIDIA RTX 5090. Values show CPU / CUDA measurements. By default uses float32; override with `precision=` parameter.
-Numbers below come from the in-repo benchmark script (`python tests/profile.py`) against the local extension build.
+Measured on an RTX 5090 with torch 2.12 + cu130 and triton 3.7, using K = 128,
+k_nn = 8 and float32. The script is `benchmarks/bench_fps.py` and the raw
+numbers are in `benchmarks/results_rtx5090_v3.json`.
 
-**FPS:**
+Op-level median time in ms (extra peak memory in MB), pure-PyTorch reference
+vs Triton:
 
-| B  | N    | K   | Baseline (ms)   | Optimized (ms) | Speedup        |
-|---:|-----:|----:|----------------:|---------------:|---------------:|
-| 4  | 100  | 20  | 0.45 / 1.48     | 0.05 / 0.10    | 9.00x / 14.80x |
-| 8  | 512  | 64  | 2.98 / 4.31     | 0.12 / 0.16    | 24.83x / 26.94x |
-| 16 | 1024 | 128 | 30.00 / 8.49    | 0.37 / 0.27    | 81.08x / 31.44x |
-| 32 | 2048 | 256 | 151.86 / 16.77  | 1.43 / 1.01    | 106.20x / 16.60x |
+| B | N | assign | knn |
+|-|-|-|-|
+| 128 | 192 | 10.5 (48) vs **0.13** (0.3) | 10.9 (49) vs **0.36** (1) |
+| 128 | 3000 | 13.9 (753) vs **0.20** (3) | 15.9 (754) vs **0.56** (3) |
+| 256 | 3000 | 18.0 (1505) vs **0.35** (6) | 22.0 (1505) vs **1.07** (6) |
 
-**FPS+kNN:**
+The reference loops over the K samples, so its cost is mostly a fixed
+per-call overhead rather than growing with N.
 
-| B  | N    | K   | k  | Baseline (ms)   | Optimized (ms) | Speedup        |
-|---:|-----:|----:|---:|----------------:|---------------:|---------------:|
-| 4  | 100  | 16  | 8  | 0.50 / 1.28     | 0.05 / 0.21    | 10.00x / 6.10x |
-| 8  | 512  | 64  | 16 | 4.97 / 4.40     | 0.17 / 1.09    | 29.24x / 4.04x |
-| 16 | 1024 | 128 | 16 | 37.27 / 8.57    | 0.79 / 2.28    | 47.18x / 3.76x |
-| 32 | 2048 | 256 | 16 | 172.63 / 18.11  | 2.64 / 5.15    | 65.39x / 3.52x |
+End to end in a Neptune model (IceCube-sized events, up to 192 pulses), the
+pure-PyTorch reference makes a training step 15–42% slower, less for larger
+batches and models, and inference 71–94% slower.
+
+On CPU (Threadripper 7970X, 32 torch threads, K = 128, k_nn = 8, float32;
+`bench_fps.py --sections cpu`, raw numbers in `benchmarks/results_cpu_v1.json`),
+median ms for the pure-PyTorch reference vs C++:
+
+| B | N | assign | knn |
+|-|-|-|-|
+| 16 | 192 | 9.0 vs **0.41** | 11.3 vs **0.11** |
+| 16 | 3000 | 56.9 vs **13.6** | 87.6 vs **1.7** |
+| 128 | 192 | 31.1 vs **1.4** | 40.5 vs **0.89** |
+| 128 | 3000 | 328 vs **269** | 378 vs **7.5** |
+
+C++ covers FPS and FPS + kNN. The assignment step after FPS (and
+`nearest_assign`) still runs the reference, which dominates `assign` at large
+B × N.

@@ -1,15 +1,11 @@
 [build-system]
-requires = [
-    "setuptools>=77",
-    "wheel",
-    "torch>=2.1",
-]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-fps"
-version = "0.5"
-description = "Native PyTorch farthest point sampling for point cloud workloads"
+version = "0.6.0"
+description = "Fast farthest point sampling for PyTorch (Triton on CUDA, JIT C++ on CPU, pure-PyTorch fallback)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -18,7 +14,7 @@ authors = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "torch>=2.1",
+    "torch>=2.7",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -33,9 +29,16 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/felixyu7/torch-fps"
+
 [tool.setuptools]
 packages = ["torch_fps"]
-include-package-data = true
 
+# C++ sources for the CPU backend, compiled just-in-time on first use (not at
+# install time, so the wheel stays pure-Python)
 [tool.setuptools.package-data]
-torch_fps = ["*.cpp", "*.cu", "*.h"]
+torch_fps = ["csrc/*.cpp"]

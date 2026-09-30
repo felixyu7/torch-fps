@@ -39,7 +39,7 @@ void fps_kernel_cpu_inner_parallel(
         if (is_valid) {
             const scalar_t* point = points + n * D;
             for (int64_t d = 0; d < D; ++d) {
-                if (std::isnan(static_cast<float>(point[d]))) {
+                if (!std::isfinite(static_cast<acc_t>(point[d]))) {
                     is_valid = false;
                     break;
                 }
@@ -163,7 +163,7 @@ void fps_kernel_cpu(
         if (is_valid) {
             const scalar_t* point = points + n * D;
             for (int64_t d = 0; d < D; ++d) {
-                if (std::isnan(static_cast<float>(point[d]))) {
+                if (!std::isfinite(static_cast<acc_t>(point[d]))) {
                     is_valid = false;
                     break;
                 }
@@ -278,7 +278,7 @@ void fps_with_knn_kernel_cpu(
         if (is_valid) {
             const scalar_t* point = points + n * D;
             for (int64_t d = 0; d < D; ++d) {
-                if (std::isnan(static_cast<float>(point[d]))) {
+                if (!std::isfinite(static_cast<acc_t>(point[d]))) {
                     is_valid = false;
                     break;
                 }
@@ -302,8 +302,9 @@ void fps_with_knn_kernel_cpu(
     }
 
     if (effective_k == 0) {
+        // No valid candidates: every neighbour slot pads with the centroid.
         std::fill(out_centroid_indices, out_centroid_indices + K, last);
-        std::fill(out_neighbor_indices, out_neighbor_indices + K * k_neighbors, 0);
+        std::fill(out_neighbor_indices, out_neighbor_indices + K * k_neighbors, last);
         return;
     }
 
@@ -380,11 +381,12 @@ void fps_with_knn_kernel_cpu(
             out_neighbor_indices[i * k_neighbors + k] = out_centroid_indices[i];
         }
     }
-    // Pad kNN rows for any padded centroid slots.
+    // Padded centroid slots repeat the last selection, so their neighbours
+    // are that centroid's neighbours (same as the reference and Triton).
     for (int64_t i = effective_k; i < K; ++i) {
-        for (int64_t k = 0; k < k_neighbors; ++k) {
-            out_neighbor_indices[i * k_neighbors + k] = out_centroid_indices[i];
-        }
+        std::copy(out_neighbor_indices + (effective_k - 1) * k_neighbors,
+                  out_neighbor_indices + effective_k * k_neighbors,
+                  out_neighbor_indices + i * k_neighbors);
     }
 }
 
